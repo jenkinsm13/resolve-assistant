@@ -55,7 +55,9 @@ pipx install resolve-assistant
 
 ### Configure Claude Desktop
 
-Add to your Claude Desktop MCP config (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
+Add to your Claude Desktop MCP config:
+- **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
 
 ```json
 {
@@ -70,6 +72,8 @@ Add to your Claude Desktop MCP config (`~/Library/Application Support/Claude/cla
   }
 }
 ```
+
+> **Windows note:** If `uvx` is not on your system PATH, use the full path to `uvx.exe` (e.g., `C:\\Users\\YOU\\.local\\bin\\uvx.exe`) as the `"command"` value.
 
 ### Configure Claude Code
 
