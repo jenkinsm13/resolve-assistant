@@ -1,6 +1,6 @@
 [project]
 name = "resolve-assistant"
-version = "0.1.3"
+version = "0.1.4"
 description = "AI-powered video editing assistant using Gemini + DaVinci Resolve"
 readme = "README.md"
 license = "MIT"
