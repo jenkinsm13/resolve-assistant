@@ -58,6 +58,7 @@ pipx install resolve-assistant
 Add to your Claude Desktop MCP config:
 - **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
 - **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
+- **Linux:** `~/.config/Claude/claude_desktop_config.json`
 
 ```json
 {
