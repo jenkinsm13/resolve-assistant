@@ -1,6 +1,6 @@
 [project]
 name = "resolve-assistant"
-version = "0.1.0"
+version = "0.1.1"
 description = "AI-powered video editing assistant using Gemini + DaVinci Resolve"
 readme = "README.md"
 license = "MIT"
@@ -22,7 +22,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "fastmcp[cli]>=3.0.0",
+    "fastmcp>=3.0.0",
     "google-genai>=1.64.0",
     "opentimelineio>=0.18.1",
     "otio-fcp-adapter>=1.0.0",
