@@ -75,7 +75,6 @@ def build_timeline_direct(edit_plan: dict, resolve_obj) -> tuple:
                 "mediaPoolItem": clip,
                 "startFrame": round(float(cut["start_sec"]) * clip_fps),
                 "endFrame": round(float(cut["end_sec"]) * clip_fps),
-                "mediaType": 1,
             }
             if "timeline_in" in cut:
                 clip_dict["recordFrame"] = round(float(cut["timeline_in"]) * timeline_fps)
