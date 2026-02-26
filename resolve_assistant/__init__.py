@@ -14,3 +14,4 @@ def main():
 # Importing these modules registers their @mcp.tool decorators.
 from . import ingest              # noqa: F401  — ingest_footage, ingest_status
 from . import build               # noqa: F401  — build_timeline, build_status
+from . import key_moments          # noqa: F401  — build_key_moments_timeline

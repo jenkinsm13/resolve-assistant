@@ -38,12 +38,16 @@ mcp = FastMCP(
         "- GEMINI_API_KEY must be set in .env\n"
         "- DaVinci Resolve must be running with scripting enabled "
         "(Preferences → System → General → External scripting using = Network)\n"
-        "- ffmpeg must be installed for video transcoding\n\n"
+        "- macOS 13+ required (uses native avconvert for hardware transcoding)\n"
+        "- ffprobe required for metadata probing (brew install ffmpeg)\n\n"
         "WORKFLOW:\n"
         "1. ingest_footage(folder) — analyze all clips with Gemini\n"
         "2. ingest_status(folder) — poll until complete\n"
         "3. build_timeline(folder, instruction) — Gemini plans an edit, built as FCP7 XML\n"
-        "4. build_status(folder) — poll until complete"
+        "4. build_status(folder) — poll until complete\n"
+        "5. build_key_moments_timeline(folder) — auto-generated timeline with every "
+        "key moment from every clip (no Gemini needed, parses sidecar JSONs). "
+        "Always run this after ingest completes to give the editor a visual index."
     ),
 )
 

@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Optional
 
 from .config import mcp
-from .transcode import get_hw_encoder
 from .media import list_all_videos, list_all_audio, list_pending_videos, list_pending_audio
 from .ingest_worker import _ingest_worker, _active_workers, _write_progress, _read_progress
 
@@ -53,13 +52,10 @@ def ingest_footage(folder_path: str, instruction: Optional[str] = None) -> str:
             )
         return "Ingestion already running."
 
-    if not shutil.which("ffmpeg"):
-        return (
-            "Error: ffmpeg not found on PATH. Install it before ingesting:\n"
-            "  macOS:   brew install ffmpeg\n"
-            "  Ubuntu:  sudo apt install ffmpeg\n"
-            "  Windows: https://ffmpeg.org/download.html"
-        )
+    if not Path("/usr/bin/avconvert").exists():
+        return "Error: avconvert not found. Requires macOS 13+ with Xcode command-line tools."
+    if not shutil.which("ffprobe"):
+        return "Error: ffprobe not found on PATH. Install: brew install ffmpeg"
 
     already_done = total - len(pending)
     _write_progress(root, {
@@ -72,10 +68,9 @@ def ingest_footage(folder_path: str, instruction: Optional[str] = None) -> str:
     thread.start()
     _active_workers[key] = thread
 
-    hw = get_hw_encoder() or "libx265"
     parts = [f"Ingestion started for {len(pending)} file(s)"]
     if pending_v:
-        parts.append(f"({len(pending_v)} video using {hw})")
+        parts.append(f"({len(pending_v)} video via avconvert)")
     if pending_a:
         parts.append(f"({len(pending_a)} audio)")
     if already_done:

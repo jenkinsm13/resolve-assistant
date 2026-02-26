@@ -1,10 +1,15 @@
 """
 Ingest background worker: Gemini upload + analysis loop, progress tracking.
+
+Transcoding runs in parallel (up to MAX_TRANSCODE_WORKERS concurrent) via
+macOS native avconvert, which uses dedicated VideoToolbox hardware encoders.
+Upload + Gemini analysis remains sequential to respect API rate limits.
 """
 
 import json
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -22,6 +27,9 @@ from .media import (
 from .prompts import ANALYSIS_PROMPT, AUDIO_ANALYSIS_PROMPT
 
 _PROGRESS_FILENAME = ".ingest_progress.json"
+
+# M1 Max has 2 dedicated HEVC encode engines — run 2 transcodes in parallel.
+MAX_TRANSCODE_WORKERS = 2
 
 # Active worker threads keyed by resolved folder path.
 _active_workers: dict[str, threading.Thread] = {}
@@ -41,27 +49,81 @@ def _read_progress(root: Path) -> Optional[dict]:
         return None
 
 
+def _transcode_one(video_path: Path) -> tuple[Path, Path | None, str | None]:
+    """Transcode a single video. Returns (original, proxy_path, error_or_None)."""
+    try:
+        proxy = prepare_for_gemini(video_path)
+        return video_path, proxy, None
+    except Exception as exc:
+        return video_path, None, str(exc)
+
+
+def _batch_transcode(
+    videos: list[Path], root: Path, already_done: int, total: int, errors: list[str],
+) -> dict[str, Path]:
+    """Transcode all pending videos in parallel. Returns {filename: proxy_path}."""
+    proxies: dict[str, Path] = {}
+
+    with ThreadPoolExecutor(max_workers=MAX_TRANSCODE_WORKERS) as pool:
+        futures = {pool.submit(_transcode_one, v): v for v in videos}
+        done_count = 0
+
+        for future in as_completed(futures):
+            original, proxy, err = future.result()
+            done_count += 1
+
+            if err:
+                errors.append(f"{original.name}: {err}")
+                log.error("Transcode failed: %s — %s", original.name, err)
+            elif proxy:
+                proxies[original.name] = proxy
+
+            _write_progress(root, {
+                "status": "running",
+                "current_file": f"transcoding ({done_count}/{len(videos)})",
+                "current_step": "transcoding",
+                "completed": already_done,
+                "total": total,
+                "errors": errors,
+            })
+
+    return proxies
+
+
 def _ingest_worker(root: Path, build_instruction: Optional[str] = None) -> None:
-    """Background thread: process all pending media files sequentially.
+    """Background thread: transcode in parallel, then upload+analyze sequentially.
 
     If *build_instruction* is provided, a timeline build is automatically
     started once all sidecars are written.
     """
     pending_videos = list_pending_videos(root)
     pending_audio = list_pending_audio(root)
-    pending = pending_videos + pending_audio
     total = len(list_all_videos(root)) + len(list_all_audio(root))
-    already_done = total - len(pending)
+    already_done = total - len(pending_videos) - len(pending_audio)
     errors: list[str] = []
+
+    # --- Phase 1: Parallel transcode (videos only) ---
+    _write_progress(root, {
+        "status": "running",
+        "current_file": f"transcoding 0/{len(pending_videos)}",
+        "current_step": "transcoding",
+        "completed": already_done,
+        "total": total,
+        "errors": errors,
+    })
+
+    proxies = _batch_transcode(pending_videos, root, already_done, total, errors)
+
+    # --- Phase 2: Sequential upload + analyze ---
+    pending = pending_videos + pending_audio
 
     for i, media_path in enumerate(pending):
         sidecar_path = media_path.with_suffix(media_path.suffix + ".json")
         is_audio = media_path.suffix.lower() in AUDIO_EXTS
 
-        step = "uploading" if is_audio else "transcoding"
         _write_progress(root, {
             "status": "running", "current_file": media_path.name,
-            "current_step": step, "completed": already_done + i,
+            "current_step": "uploading", "completed": already_done + i,
             "total": total, "errors": errors,
         })
 
@@ -69,12 +131,7 @@ def _ingest_worker(root: Path, build_instruction: Optional[str] = None) -> None:
             if is_audio:
                 upload_path = media_path
             else:
-                upload_path = prepare_for_gemini(media_path)
-                _write_progress(root, {
-                    "status": "running", "current_file": media_path.name,
-                    "current_step": "uploading", "completed": already_done + i,
-                    "total": total, "errors": errors,
-                })
+                upload_path = proxies.get(media_path.name, media_path)
 
             file_ref = retry_gemini(client.files.upload, file=str(upload_path))
             while file_ref.state.name == "PROCESSING":

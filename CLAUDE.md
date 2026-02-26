@@ -6,7 +6,7 @@ AI-powered video editing assistant. Uses Google Gemini to analyze footage, plan 
 
 - **Package**: `resolve_assistant/` — all modules use relative imports (`from .config import mcp`)
 - **Entry point**: `resolve_assistant/__init__.py` → `main()` → `mcp.run()`
-- **Tool registration**: `ingest.py` and `build.py` are imported in `__init__.py`, registering 4 `@mcp.tool` functions
+- **Tool registration**: `ingest.py`, `build.py`, and `key_moments.py` are imported in `__init__.py`, registering 5 `@mcp.tool` functions
 - **Gemini is required** — `config.py` raises `RuntimeError` if `GEMINI_API_KEY` is not set
 
 ## The 4 MCP Tools
@@ -17,11 +17,12 @@ AI-powered video editing assistant. Uses Google Gemini to analyze footage, plan 
 | `ingest_status(folder_path)` | `ingest.py` | Poll ingest progress |
 | `build_timeline(folder_path, instruction)` | `build.py` | Plan edit + build timeline (background) |
 | `build_status(folder_path)` | `build.py` | Poll build progress |
+| `build_key_moments_timeline(folder_path)` | `key_moments.py` | Timeline with one clip per key moment (no Gemini) |
 
 ## Pipeline
 
 ```
-Raw Footage → ffprobe → transcode proxy → Gemini analysis → sidecar JSON
+Raw Footage → ffprobe → avconvert proxy → Gemini analysis → sidecar JSON
                                                                 ↓
 Instruction → upload proxies → Gemini edit plan → AppendToTimeline → Resolve timeline
                                     ↓
@@ -41,12 +42,14 @@ Instruction → upload proxies → Gemini edit plan → AppendToTimeline → Res
 - Tools return immediately with a status message
 - Use `_status()` tools to poll for completion
 
-### Transcoding (`transcode.py`)
-- Apple Silicon: `hevc_videotoolbox` (hardware)
-- Other platforms: `libx265` (software)
+### Transcoding (`transcode.py`) — MUST use macOS native avconvert
+- **NEVER use ffmpeg for transcoding. This is non-negotiable.**
+- Uses `/usr/bin/avconvert --preset Preset1280x720` (AVFoundation/VideoToolbox hardware)
+- M1 Max has 2 dedicated HEVC encode engines — parallel transcoding (2 workers)
 - Proxy files saved as `.gemini.mp4` next to source
 - Resolution capped at 1280px longest edge
 - Files already in H.264/H.265, under 2GB, ≤1280px are uploaded as-is
+- `ffprobe` is still used for metadata probing (codec, resolution, duration, timecodes) — that's fine, it's read-only
 
 ### Resolve connection (`resolve.py`)
 - `get_resolve()` returns Resolve scripting object (or `None`)
