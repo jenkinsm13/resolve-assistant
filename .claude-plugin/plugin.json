@@ -1,0 +1,21 @@
+{
+  "name": "resolve-assistant",
+  "version": "0.1.4",
+  "description": "AI-powered video editing assistant using Gemini + DaVinci Resolve. Analyzes footage, plans edits, and builds timelines automatically.",
+  "author": {
+    "name": "Mike Jenkins",
+    "url": "https://github.com/jenkinsm13"
+  },
+  "repository": "https://github.com/jenkinsm13/resolve-assistant",
+  "license": "MIT",
+  "keywords": ["davinci-resolve", "ai-editing", "gemini", "video-editing", "mcp"],
+  "mcpServers": {
+    "resolve-assistant": {
+      "command": "uv",
+      "args": ["run", "--directory", ".", "python", "-m", "resolve_assistant"],
+      "env": {
+        "GEMINI_API_KEY": "${GEMINI_API_KEY}"
+      }
+    }
+  }
+}
