@@ -7,22 +7,31 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-from .config import mcp
+from .config import mcp, OLLAMA_BASE_URL
 from .media import list_all_videos, list_all_audio, list_pending_videos, list_pending_audio
 from .ingest_worker import _ingest_worker, _active_workers, _write_progress, _read_progress
 
 
 @mcp.tool
-def ingest_footage(folder_path: str, instruction: Optional[str] = None) -> str:
+def ingest_footage(
+    folder_path: str,
+    instruction: Optional[str] = None,
+    backend: str = "gemini",
+    fps: float = 0.5,
+) -> str:
     """
-    Scan a folder for video and audio files and analyze them with Gemini.
-    Launches a background worker that processes ALL pending files
-    (transcoding via VideoToolbox on Apple Silicon, then uploading).
+    Scan a folder for video and audio files and analyze them.
+    Launches a background worker that processes ALL pending files.
     Returns immediately — use ingest_status() to monitor progress.
     Files with existing .json sidecars are skipped automatically.
 
     If *instruction* is provided, a timeline build is automatically triggered
     once all sidecars are written — no manual follow-up needed.
+
+    *backend*: "gemini" (default, cloud API) or "ollama" (local Gemma 4 e4b).
+    *fps*: Frame sampling rate for Ollama backend (default 0.5 = 1 frame per 2 sec).
+           Higher values (1, 2, 4) give more precise analysis but take longer.
+           Ignored for Gemini backend.
     """
     root = Path(folder_path).resolve()
     if not root.is_dir():
@@ -52,8 +61,17 @@ def ingest_footage(folder_path: str, instruction: Optional[str] = None) -> str:
             )
         return "Ingestion already running."
 
-    if not Path("/usr/bin/avconvert").exists():
-        return "Error: avconvert not found. Requires macOS 13+ with Xcode command-line tools."
+    if backend == "ollama":
+        # Verify Ollama is running
+        try:
+            import urllib.request
+            urllib.request.urlopen(f"{OLLAMA_BASE_URL}/api/tags", timeout=5)
+        except Exception:
+            return f"Error: Ollama not reachable at {OLLAMA_BASE_URL}. Is it running?"
+    else:
+        if not Path("/usr/bin/avconvert").exists():
+            return "Error: avconvert not found. Requires macOS 13+ with Xcode command-line tools."
+
     if not shutil.which("ffprobe"):
         return "Error: ffprobe not found on PATH. Install: brew install ffmpeg"
 
@@ -64,13 +82,20 @@ def ingest_footage(folder_path: str, instruction: Optional[str] = None) -> str:
         "total": total, "errors": [],
     })
 
-    thread = threading.Thread(target=_ingest_worker, args=(root, instruction), daemon=True)
+    thread = threading.Thread(
+        target=_ingest_worker,
+        args=(root, instruction, backend, fps),
+        daemon=True,
+    )
     thread.start()
     _active_workers[key] = thread
 
-    parts = [f"Ingestion started for {len(pending)} file(s)"]
-    if pending_v:
+    engine = "Ollama/Gemma4" if backend == "ollama" else "Gemini"
+    parts = [f"Ingestion started for {len(pending)} file(s) via {engine}"]
+    if pending_v and backend != "ollama":
         parts.append(f"({len(pending_v)} video via avconvert)")
+    elif pending_v:
+        parts.append(f"({len(pending_v)} video at {fps} fps)")
     if pending_a:
         parts.append(f"({len(pending_a)} audio)")
     if already_done:
@@ -118,3 +143,87 @@ def ingest_status(folder_path: str) -> str:
         return msg
 
     return f"Ingestion status: {status}. {completed}/{total} done."
+
+
+@mcp.tool
+def ingest_drill_down(
+    folder_path: str,
+    clip_name: str,
+    start_sec: float,
+    end_sec: float,
+    fps: float = 4.0,
+) -> str:
+    """
+    Re-analyze a specific time range of a clip at higher frame density.
+
+    Use after a coarse ingest pass to get precise segment boundaries or
+    investigate a specific moment. Merges high-density segments into the
+    existing sidecar, replacing any segments that overlap the drill range.
+
+    Only works with the Ollama backend (local analysis).
+
+    *clip_name*: filename of the clip (e.g. "A001_02031700_C006.mov")
+    *start_sec*: start of the range to re-analyze
+    *end_sec*: end of the range to re-analyze
+    *fps*: frame sampling rate (default 4.0 = 4 frames/sec for detailed analysis)
+    """
+    import json as _json
+    import urllib.request
+    from .ollama_analyzer import analyze_video
+
+    root = Path(folder_path).resolve()
+    if not root.is_dir():
+        return f"Error: '{folder_path}' is not a valid directory."
+
+    # Find the clip
+    clip_path = root / clip_name
+    if not clip_path.exists():
+        matches = [f for f in root.iterdir() if f.name.lower() == clip_name.lower()]
+        if matches:
+            clip_path = matches[0]
+        else:
+            return f"Error: clip '{clip_name}' not found in {root}"
+
+    sidecar_path = clip_path.with_suffix(clip_path.suffix + ".json")
+
+    # Verify Ollama is running
+    try:
+        urllib.request.urlopen(f"{OLLAMA_BASE_URL}/api/tags", timeout=5)
+    except Exception:
+        return f"Error: Ollama not reachable at {OLLAMA_BASE_URL}. Is it running?"
+
+    try:
+        result = analyze_video(
+            clip_path, fps=fps, start_sec=start_sec, end_sec=end_sec,
+        )
+
+        new_segments = result.get("segments", [])
+
+        if sidecar_path.exists():
+            existing = _json.loads(sidecar_path.read_text(encoding="utf-8"))
+            old_segments = existing.get("segments", [])
+
+            # Keep segments fully outside the drill range
+            kept = [
+                s for s in old_segments
+                if s["end_sec"] <= start_sec or s["start_sec"] >= end_sec
+            ]
+            kept.extend(new_segments)
+            kept.sort(key=lambda s: s["start_sec"])
+
+            existing["segments"] = kept
+            sidecar_path.write_text(_json.dumps(existing, indent=2), encoding="utf-8")
+            return (
+                f"Drill-down complete: {clip_name} [{start_sec:.1f}s-{end_sec:.1f}s] "
+                f"at {fps} fps. {len(new_segments)} new segments merged "
+                f"into existing sidecar ({len(kept)} total segments)."
+            )
+        else:
+            sidecar_path.write_text(_json.dumps(result, indent=2), encoding="utf-8")
+            return (
+                f"Drill-down complete: {clip_name} [{start_sec:.1f}s-{end_sec:.1f}s] "
+                f"at {fps} fps. {len(new_segments)} segments written."
+            )
+
+    except Exception as exc:
+        return f"Drill-down failed for {clip_name}: {exc}"

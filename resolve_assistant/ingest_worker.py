@@ -1,9 +1,8 @@
 """
-Ingest background worker: Gemini upload + analysis loop, progress tracking.
+Ingest background worker: analysis loop with Gemini or Ollama backend.
 
-Transcoding runs in parallel (up to MAX_TRANSCODE_WORKERS concurrent) via
-macOS native avconvert, which uses dedicated VideoToolbox hardware encoders.
-Upload + Gemini analysis remains sequential to respect API rate limits.
+Gemini path: transcode in parallel (avconvert), upload + analyze sequentially.
+Ollama path: extract frames + audio via ffmpeg, analyze locally via Gemma 4.
 """
 
 import json
@@ -13,11 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
-from google.genai import types
-
 from .config import MODEL, AUDIO_EXTS, client, log
-from .retry import retry_gemini
-from .schemas import VideoSidecar, AudioSidecar
 from .ffprobe import ffprobe_fps, ffprobe_duration
 from .transcode import prepare_for_gemini
 from .media import (
@@ -25,6 +20,10 @@ from .media import (
     list_pending_videos, list_pending_audio,
 )
 from .prompts import ANALYSIS_PROMPT, AUDIO_ANALYSIS_PROMPT
+from .ollama_analyzer import (
+    analyze_video as ollama_analyze_video,
+    analyze_audio as ollama_analyze_audio,
+)
 
 _PROGRESS_FILENAME = ".ingest_progress.json"
 
@@ -90,8 +89,53 @@ def _batch_transcode(
     return proxies
 
 
-def _ingest_worker(root: Path, build_instruction: Optional[str] = None) -> None:
-    """Background thread: transcode in parallel, then upload+analyze sequentially.
+def _analyze_gemini(media_path: Path, upload_path: Path, is_audio: bool) -> dict:
+    """Analyze a single file using Gemini API. Returns sidecar dict."""
+    from google.genai import types
+    from .retry import retry_gemini
+    from .schemas import VideoSidecar, AudioSidecar
+
+    file_ref = retry_gemini(client.files.upload, file=str(upload_path))
+    while file_ref.state.name == "PROCESSING":
+        time.sleep(2)
+        file_ref = client.files.get(name=file_ref.name)
+
+    if file_ref.state.name != "ACTIVE":
+        raise RuntimeError(f"Upload state={file_ref.state.name}")
+
+    if is_audio:
+        response = retry_gemini(
+            client.models.generate_content, model=MODEL,
+            contents=[file_ref, AUDIO_ANALYSIS_PROMPT],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=AudioSidecar,
+            ),
+        )
+    else:
+        response = retry_gemini(
+            client.models.generate_content, model=MODEL,
+            contents=[file_ref, ANALYSIS_PROMPT],
+            config=types.GenerateContentConfig(
+                media_resolution=types.MediaResolution.MEDIA_RESOLUTION_HIGH,
+                response_mime_type="application/json",
+                response_schema=VideoSidecar,
+            ),
+        )
+
+    return json.loads(response.text)
+
+
+def _ingest_worker(
+    root: Path,
+    build_instruction: Optional[str] = None,
+    backend: str = "gemini",
+    fps: float = 0.5,
+) -> None:
+    """Background thread: analyze all pending media files.
+
+    *backend*: "gemini" (cloud API) or "ollama" (local Gemma 4 e4b).
+    *fps*: Frame sampling rate for Ollama backend.
 
     If *build_instruction* is provided, a timeline build is automatically
     started once all sidecars are written.
@@ -102,76 +146,67 @@ def _ingest_worker(root: Path, build_instruction: Optional[str] = None) -> None:
     already_done = total - len(pending_videos) - len(pending_audio)
     errors: list[str] = []
 
-    # --- Phase 1: Parallel transcode (videos only) ---
-    _write_progress(root, {
-        "status": "running",
-        "current_file": f"transcoding 0/{len(pending_videos)}",
-        "current_step": "transcoding",
-        "completed": already_done,
-        "total": total,
-        "errors": errors,
-    })
+    # --- Phase 1: Parallel transcode (Gemini backend only) ---
+    proxies: dict[str, Path] = {}
+    if backend != "ollama":
+        _write_progress(root, {
+            "status": "running",
+            "current_file": f"transcoding 0/{len(pending_videos)}",
+            "current_step": "transcoding",
+            "completed": already_done,
+            "total": total,
+            "errors": errors,
+        })
+        proxies = _batch_transcode(pending_videos, root, already_done, total, errors)
+    else:
+        _write_progress(root, {
+            "status": "running",
+            "current_file": "starting ollama analysis",
+            "current_step": "analyzing",
+            "completed": already_done,
+            "total": total,
+            "errors": errors,
+        })
 
-    proxies = _batch_transcode(pending_videos, root, already_done, total, errors)
-
-    # --- Phase 2: Sequential upload + analyze ---
+    # --- Phase 2: Analyze each file ---
     pending = pending_videos + pending_audio
 
     for i, media_path in enumerate(pending):
         sidecar_path = media_path.with_suffix(media_path.suffix + ".json")
         is_audio = media_path.suffix.lower() in AUDIO_EXTS
 
-        _write_progress(root, {
-            "status": "running", "current_file": media_path.name,
-            "current_step": "uploading", "completed": already_done + i,
-            "total": total, "errors": errors,
-        })
-
         try:
-            if is_audio:
-                upload_path = media_path
+            if backend == "ollama":
+                _write_progress(root, {
+                    "status": "running", "current_file": media_path.name,
+                    "current_step": "analyzing (ollama)",
+                    "completed": already_done + i,
+                    "total": total, "errors": errors,
+                })
+
+                if is_audio:
+                    sidecar_data = ollama_analyze_audio(media_path)
+                else:
+                    sidecar_data = ollama_analyze_video(media_path, fps=fps)
             else:
-                upload_path = proxies.get(media_path.name, media_path)
+                # Gemini path — upload then analyze
+                if is_audio:
+                    upload_path = media_path
+                else:
+                    upload_path = proxies.get(media_path.name, media_path)
 
-            file_ref = retry_gemini(client.files.upload, file=str(upload_path))
-            while file_ref.state.name == "PROCESSING":
-                time.sleep(2)
-                file_ref = client.files.get(name=file_ref.name)
+                _write_progress(root, {
+                    "status": "running", "current_file": media_path.name,
+                    "current_step": "uploading",
+                    "completed": already_done + i,
+                    "total": total, "errors": errors,
+                })
 
-            if file_ref.state.name != "ACTIVE":
-                errors.append(f"{media_path.name}: upload state={file_ref.state.name}")
-                continue
+                sidecar_data = _analyze_gemini(media_path, upload_path, is_audio)
+                sidecar_data["analysis_model"] = MODEL
 
-            _write_progress(root, {
-                "status": "running", "current_file": media_path.name,
-                "current_step": "analyzing", "completed": already_done + i,
-                "total": total, "errors": errors,
-            })
-
-            if is_audio:
-                response = retry_gemini(
-                    client.models.generate_content, model=MODEL,
-                    contents=[file_ref, AUDIO_ANALYSIS_PROMPT],
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=AudioSidecar,
-                    ),
-                )
-            else:
-                response = retry_gemini(
-                    client.models.generate_content, model=MODEL,
-                    contents=[file_ref, ANALYSIS_PROMPT],
-                    config=types.GenerateContentConfig(
-                        media_resolution=types.MediaResolution.MEDIA_RESOLUTION_HIGH,
-                        response_mime_type="application/json",
-                        response_schema=VideoSidecar,
-                    ),
-                )
-
-            sidecar_data = json.loads(response.text)
             sidecar_data["file_path"] = str(media_path)
             sidecar_data["filename"] = media_path.name
-            sidecar_data["analysis_model"] = MODEL
 
             if not is_audio:
                 probe_fps = ffprobe_fps(media_path)

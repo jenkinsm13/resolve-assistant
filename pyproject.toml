@@ -41,3 +41,8 @@ Issues = "https://github.com/jenkinsm13/resolve-assistant/issues"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
