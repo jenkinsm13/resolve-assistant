@@ -27,7 +27,7 @@ def ingest_footage(
     folder_path: str,
     instruction: Optional[str] = None,
     backend: str = "ollama",
-    fps: float = 2.0,
+    fps: float = 10.0,
 ) -> str:
     """
     Scan a folder for video and audio files and analyze them.
@@ -39,9 +39,9 @@ def ingest_footage(
     once all sidecars are written — no manual follow-up needed.
 
     *backend*: "ollama" (default, local Gemma 4 e4b) or "gemini" (cloud API).
-    *fps*: Frame sampling rate for Ollama backend (default 2.0).
+    *fps*: Frame sampling rate for Ollama backend (default 10.0).
            Frames are composited into a contact sheet grid for temporal analysis.
-           Higher values (4, 8) give more frames but larger grids. Ignored for Gemini.
+           Ignored for Gemini backend.
     """
     root = Path(folder_path).resolve()
     if not root.is_dir():

@@ -202,6 +202,14 @@ a single segment.
   Do NOT default to "Static" — look for evidence of movement before
   concluding the camera is locked off.
 
+  HOW TO IDENTIFY HANDHELD WALKTHROUGHS:
+  If frames show different angles, surfaces, or parts of the SAME subject
+  (e.g. a vehicle interior: floor → seat → dashboard → door → ground → seat)
+  at similar proximity, with no hard cuts, this is a CONTINUOUS HANDHELD
+  walkthrough — the camera operator is walking around or through the subject.
+  Label this as "Handheld" even though individual frames may look like
+  separate static shots. The clue is: same subject, changing angle, no cuts.
+
 - Rate visual quality 1-10.
 - Tag notable objects, locations, vehicles, people, or actions.
 
