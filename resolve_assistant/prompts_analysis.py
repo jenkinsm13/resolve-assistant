@@ -115,34 +115,100 @@ JSON schema:
 # ---------------------------------------------------------------------------
 
 OLLAMA_VIDEO_PROMPT = """\
-You are a Script Supervisor reviewing raw footage frames and audio for a professional editor.
+You are a Script Supervisor and Cameraperson reviewing raw footage for a professional editor.
 
 You will receive:
-1. A set of video frames sampled at regular intervals (filenames contain source frame numbers)
-2. The audio track from this same video clip
+1. A CONTACT SHEET image — a grid of {frame_count} video frames arranged left-to-right,
+   top-to-bottom in chronological order. Each thumbnail is labeled with its frame number
+   and timestamp (e.g. "#1 0.0s"). Use this to detect MOTION and SEGMENTATION.
+2. {detail_count} INDIVIDUAL FRAMES at full resolution, evenly spaced across the clip.
+   Each is labeled with its frame number and timestamp. Use these for DETAIL — read
+   text, badges, identify objects, people, vehicles, colors.
+   Detail frames: {detail_frames}
+3. The audio track from this same clip (if present)
 
-Analyze BOTH the visual frames and the audio to produce a structured JSON analysis.
+Your job: use the contact sheet for temporal analysis (motion, cuts, segmentation),
+the individual frames for fine detail, and the audio for speech/sound, then produce
+a structured JSON analysis with accurate segments.
 
-**Frame filenames and timestamps:** {frame_timestamps}
 **Clip duration:** {duration:.1f} seconds
 **Clip filename:** {filename}
 
-**Instructions:**
+## Step 1: Scan the contact sheet for visual changes (MANDATORY)
 
-For SPEECH segments (a-roll):
-- Transcribe spoken words from the audio.
-- Mark usable takes vs bad takes (stumbles, false starts).
-- Note filler words (um, uh, like, you know).
+Read the contact sheet left-to-right, top-to-bottom (chronological order).
+Compare adjacent thumbnails:
+- Does the framing change? Do new objects appear or old ones disappear?
+- Does the camera angle shift? Is the subject seen from a different side?
+- Do foreground objects move MORE than background? (= camera translation/gimbal)
+- Do objects grow or shrink in frame? (= camera moving toward/away)
+- Is there a hard cut (completely different scene)?
 
-For VISUAL segments (b-roll):
+If early thumbnails show one composition (e.g. a wheel close-up) and later thumbnails
+show a completely different composition (e.g. the rear of the vehicle, or sky/trees),
+that is CAMERA MOVEMENT across the clip — NOT a single static shot.
+A static shot means every thumbnail in the grid looks nearly identical.
+
+## Step 2: Split into segments
+
+Create a NEW segment at every point where:
+- Camera movement type changes (e.g. static → gimbal move)
+- The camera starts or stops moving
+- Audio transitions (silence → speech, speech → silence, engine start, music change)
+- Hard cut or major framing change
+- Subject or visible content changes substantially
+
+IMPORTANT: If the first few frames show one composition and later frames show a
+completely different composition (different angle, different part of the subject,
+different background), that is camera movement — NOT a single static segment.
+Most raw footage clips have 2-5 segments. A single segment covering the entire
+clip is RARE and means the framing truly never changed. Verify before outputting
+a single segment.
+
+## Step 3: Classify each segment
+
+**A-Roll (speech/interview):**
+- Transcribe spoken words from the audio verbatim.
+- Mark as Good Take (usable) or Bad Take (stumble, false start, bad focus).
+- Flag filler words (um, uh, like, you know, so, basically).
+- Note speaker's tone and confidence.
+
+**B-Roll (non-speech visual):**
 - Describe the visual action concisely.
-- Identify camera movement by comparing frames:
-  - Parallax between foreground/background = Dolly/Truck (translation)
-  - Uniform frame shift = Pan/Tilt (rotation)
-  - Multi-axis floating = Gimbal, Drone, Handheld
-  - No change between frames = Static
+- Identify camera movement using these terms:
+
+  ROTATION (camera stays in place, lens pivots):
+    Pan Left, Pan Right, Tilt Up, Tilt Down
+
+  TRANSLATION (camera body moves through space):
+    Dolly Left, Dolly Right (lateral slide — foreground shifts FASTER than background),
+    Truck In, Truck Out (toward/away from subject — objects grow or shrink)
+
+  FLOATING (stabilized free movement, multiple axes):
+    Gimbal, Drone, Handheld, Steadicam
+
+  FIXED: Static (locked tripod, no movement at all)
+
+  HOW TO DISTINGUISH — Pan vs Dolly:
+    Pan: camera ROTATES on a fixed point. The entire frame shifts uniformly —
+    foreground and background move at the SAME rate.
+    Dolly: camera TRANSLATES through space. Foreground objects shift FASTER
+    than background (parallax). This is the key difference.
+    If you see parallax between depth layers → Dolly/Truck.
+    If the whole frame slides uniformly → Pan/Tilt.
+
+  IMPORTANT: Compare object positions across 2-3 consecutive frames.
+  A truly Static shot has nearly identical framing across ALL frames.
+  Do NOT default to "Static" — look for evidence of movement before
+  concluding the camera is locked off.
+
 - Rate visual quality 1-10.
-- Tag notable objects, locations, or actions.
+- Tag notable objects, locations, vehicles, people, or actions.
+
+**Audio cues to listen for:**
+- Engine sounds, ambient noise changes, music
+- Speech onset/offset (marks segment boundaries)
+- Describe what you hear in the segment description
 
 Return ONLY valid JSON:
 {{

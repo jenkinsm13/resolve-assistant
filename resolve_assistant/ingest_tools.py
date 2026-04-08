@@ -8,16 +8,26 @@ from pathlib import Path
 from typing import Optional
 
 from .config import mcp, OLLAMA_BASE_URL
-from .media import list_all_videos, list_all_audio, list_pending_videos, list_pending_audio
-from .ingest_worker import _ingest_worker, _active_workers, _write_progress, _read_progress
+from .media import (
+    list_all_videos,
+    list_all_audio,
+    list_pending_videos,
+    list_pending_audio,
+)
+from .ingest_worker import (
+    _ingest_worker,
+    _active_workers,
+    _write_progress,
+    _read_progress,
+)
 
 
 @mcp.tool
 def ingest_footage(
     folder_path: str,
     instruction: Optional[str] = None,
-    backend: str = "gemini",
-    fps: float = 0.5,
+    backend: str = "ollama",
+    fps: float = 2.0,
 ) -> str:
     """
     Scan a folder for video and audio files and analyze them.
@@ -28,10 +38,10 @@ def ingest_footage(
     If *instruction* is provided, a timeline build is automatically triggered
     once all sidecars are written — no manual follow-up needed.
 
-    *backend*: "gemini" (default, cloud API) or "ollama" (local Gemma 4 e4b).
-    *fps*: Frame sampling rate for Ollama backend (default 0.5 = 1 frame per 2 sec).
-           Higher values (1, 2, 4) give more precise analysis but take longer.
-           Ignored for Gemini backend.
+    *backend*: "ollama" (default, local Gemma 4 e4b) or "gemini" (cloud API).
+    *fps*: Frame sampling rate for Ollama backend (default 2.0).
+           Frames are composited into a contact sheet grid for temporal analysis.
+           Higher values (4, 8) give more frames but larger grids. Ignored for Gemini.
     """
     root = Path(folder_path).resolve()
     if not root.is_dir():
@@ -65,6 +75,7 @@ def ingest_footage(
         # Verify Ollama is running
         try:
             import urllib.request
+
             urllib.request.urlopen(f"{OLLAMA_BASE_URL}/api/tags", timeout=5)
         except Exception:
             return f"Error: Ollama not reachable at {OLLAMA_BASE_URL}. Is it running?"
@@ -76,11 +87,17 @@ def ingest_footage(
         return "Error: ffprobe not found on PATH. Install: brew install ffmpeg"
 
     already_done = total - len(pending)
-    _write_progress(root, {
-        "status": "starting", "current_file": pending[0].name,
-        "current_step": "queued", "completed": already_done,
-        "total": total, "errors": [],
-    })
+    _write_progress(
+        root,
+        {
+            "status": "starting",
+            "current_file": pending[0].name,
+            "current_step": "queued",
+            "completed": already_done,
+            "total": total,
+            "errors": [],
+        },
+    )
 
     thread = threading.Thread(
         target=_ingest_worker,
@@ -121,7 +138,9 @@ def ingest_status(folder_path: str) -> str:
         total = len(list_all_videos(root)) + len(list_all_audio(root))
         if not pending:
             return f"All {total} file(s) have sidecars. No ingestion needed."
-        return f"{len(pending)} of {total} file(s) pending. Run ingest_footage to start."
+        return (
+            f"{len(pending)} of {total} file(s) pending. Run ingest_footage to start."
+        )
 
     status = progress.get("status", "unknown")
     completed = progress.get("completed", 0)
@@ -194,7 +213,10 @@ def ingest_drill_down(
 
     try:
         result = analyze_video(
-            clip_path, fps=fps, start_sec=start_sec, end_sec=end_sec,
+            clip_path,
+            fps=fps,
+            start_sec=start_sec,
+            end_sec=end_sec,
         )
 
         new_segments = result.get("segments", [])
@@ -205,7 +227,8 @@ def ingest_drill_down(
 
             # Keep segments fully outside the drill range
             kept = [
-                s for s in old_segments
+                s
+                for s in old_segments
                 if s["end_sec"] <= start_sec or s["start_sec"] >= end_sec
             ]
             kept.extend(new_segments)

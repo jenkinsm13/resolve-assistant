@@ -4,14 +4,17 @@ Ollama/Gemma 4 analyzer: local video+audio analysis via frame extraction.
 Pipeline per clip:
 1. Extract frames at configurable fps via ffmpeg (JPEG, scaled)
 2. Extract audio track via ffmpeg (WAV, 16kHz mono)
-3. Send frames + audio to Ollama as multimodal chat message
-4. Parse JSON response into VideoSidecar format
+3. Build a contact sheet grid (temporal overview) + label individual frames
+4. Send contact sheet + individual frames + audio to Ollama
+5. Parse JSON response into VideoSidecar format
 
-Frame filenames use real source frame numbers (e.g. frame_000060.jpg = frame 60
-in the original clip) so the model sees meaningful identifiers.
+The dual-image approach gives the model both temporal context (contact sheet
+for motion/segmentation) and fine detail (individual frames for badges, text,
+people, vehicle details).
 """
 
 import base64
+import io
 import json
 import re
 import subprocess
@@ -53,9 +56,12 @@ def extract_frames(
     if end_sec is not None:
         cmd += ["-t", str(end_sec - start_sec)]
     cmd += [
-        "-vf", f"fps={fps},scale={OLLAMA_FRAME_MAX_EDGE}:-1",
-        "-q:v", "3",
-        str(out_dir / "frame_%04d.jpg"), "-y",
+        "-vf",
+        f"fps={fps},scale={OLLAMA_FRAME_MAX_EDGE}:-1",
+        "-q:v",
+        "3",
+        str(out_dir / "frame_%04d.jpg"),
+        "-y",
     ]
     subprocess.run(cmd, capture_output=True, timeout=120, check=True)
 
@@ -91,8 +97,13 @@ def extract_audio(
     if end_sec is not None:
         cmd += ["-t", str(end_sec - start_sec)]
     cmd += [
-        "-vn", "-ar", str(OLLAMA_AUDIO_SAMPLE_RATE), "-ac", "1",
-        str(out_path), "-y",
+        "-vn",
+        "-ar",
+        str(OLLAMA_AUDIO_SAMPLE_RATE),
+        "-ac",
+        "1",
+        str(out_path),
+        "-y",
     ]
     try:
         subprocess.run(cmd, capture_output=True, timeout=120, check=True)
@@ -104,21 +115,109 @@ def extract_audio(
     return None
 
 
+def _label_frame(img_path: Path, label: str) -> bytes:
+    """Burn a label into the bottom-left of a frame image. Returns JPEG bytes."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    img = Image.open(img_path)
+    draw = ImageDraw.Draw(img)
+
+    # Use a size proportional to image height
+    font_size = max(16, img.height // 20)
+    try:
+        font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", font_size)
+    except (OSError, IOError):
+        font = ImageFont.load_default(size=font_size)
+
+    # Text with black outline for readability
+    x, y = 8, img.height - font_size - 12
+    for dx, dy in [(-2, 0), (2, 0), (0, -2), (0, 2), (-2, -2), (2, 2)]:
+        draw.text((x + dx, y + dy), label, fill="black", font=font)
+    draw.text((x, y), label, fill="white", font=font)
+
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    return buf.getvalue()
+
+
+def build_contact_sheet(
+    frame_results: list[tuple[Path, float]],
+    cols: int = 5,
+    thumb_width: int = 320,
+) -> bytes:
+    """Build a labeled contact sheet grid from extracted frames.
+
+    Each thumbnail gets a frame number label burned in (e.g. "#1 0.0s").
+    Frames are tiled left-to-right, top-to-bottom in chronological order.
+    Returns JPEG bytes of the composite image.
+    """
+    from PIL import Image, ImageDraw, ImageFont
+
+    if not frame_results:
+        raise ValueError("No frames to build contact sheet from")
+
+    # Load and label each thumbnail
+    thumbs: list[Image.Image] = []
+    for i, (frame_path, t) in enumerate(frame_results):
+        img = Image.open(frame_path)
+        # Scale to thumb width
+        ratio = thumb_width / img.width
+        thumb = img.resize((thumb_width, int(img.height * ratio)), Image.LANCZOS)
+
+        # Burn in label
+        draw = ImageDraw.Draw(thumb)
+        font_size = max(14, thumb.height // 12)
+        try:
+            font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", font_size)
+        except (OSError, IOError):
+            font = ImageFont.load_default(size=font_size)
+
+        label = f"#{i + 1} {t:.1f}s"
+        x, y = 6, thumb.height - font_size - 8
+        for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            draw.text((x + dx, y + dy), label, fill="black", font=font)
+        draw.text((x, y), label, fill="white", font=font)
+
+        thumbs.append(thumb)
+
+    # Compute grid dimensions
+    rows = (len(thumbs) + cols - 1) // cols
+    thumb_h = thumbs[0].height
+    pad = 4
+    grid_w = cols * thumb_width + (cols + 1) * pad
+    grid_h = rows * thumb_h + (rows + 1) * pad
+
+    grid = Image.new("RGB", (grid_w, grid_h), "black")
+    for i, thumb in enumerate(thumbs):
+        r, c = divmod(i, cols)
+        x = pad + c * (thumb_width + pad)
+        y = pad + r * (thumb_h + pad)
+        grid.paste(thumb, (x, y))
+
+    buf = io.BytesIO()
+    grid.save(buf, format="JPEG", quality=85)
+    return buf.getvalue()
+
+
 def _ollama_chat(prompt: str, images: list[str], timeout: int = OLLAMA_TIMEOUT) -> str:
     """Send a multimodal chat request to Ollama. Returns response text.
 
     *images* is a list of base64-encoded image or audio data.
     """
-    payload = json.dumps({
-        "model": OLLAMA_MODEL,
-        "messages": [{
-            "role": "user",
-            "content": prompt,
-            "images": images,
-        }],
-        "stream": False,
-        "format": "json",
-    }).encode()
+    payload = json.dumps(
+        {
+            "model": OLLAMA_MODEL,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt,
+                    "images": images,
+                }
+            ],
+            "stream": False,
+            "format": "json",
+        }
+    ).encode()
 
     req = urllib.request.Request(
         f"{OLLAMA_BASE_URL}/api/chat",
@@ -131,7 +230,11 @@ def _ollama_chat(prompt: str, images: list[str], timeout: int = OLLAMA_TIMEOUT) 
 
 
 def _parse_ollama_response(
-    raw: str, filename: str, file_path: str, fps: float, duration: float,
+    raw: str,
+    filename: str,
+    file_path: str,
+    fps: float,
+    duration: float,
 ) -> dict:
     """Parse Ollama response text into sidecar dict. Handles markdown fences."""
     text = raw.strip()
@@ -181,23 +284,47 @@ def analyze_video(
 
     log.info(
         "Ollama analyzing %s (%.1fs at %.1f fps, range %.1f-%.1fs)",
-        video_path.name, analyze_duration, fps, start_sec, analyze_end,
+        video_path.name,
+        analyze_duration,
+        fps,
+        start_sec,
+        analyze_end,
     )
 
     # Extract frames with source frame numbers
-    frame_results = extract_frames(video_path, fps=fps, start_sec=start_sec, end_sec=end_sec)
+    frame_results = extract_frames(
+        video_path, fps=fps, start_sec=start_sec, end_sec=end_sec
+    )
     if not frame_results:
         raise RuntimeError(f"No frames extracted from {video_path.name}")
 
-    # Build base64 images and timestamp labels
-    images: list[str] = []
+    # Image 1: Contact sheet for temporal/motion overview (all frames)
+    sheet_bytes = build_contact_sheet(frame_results)
+    images: list[str] = [base64.b64encode(sheet_bytes).decode()]
+
+    # Images 2..M+1: Subset of individual labeled frames for fine detail.
+    # Send ~5-8 evenly spaced frames to avoid overwhelming the model.
+    max_detail_frames = 8
+    n = len(frame_results)
+    if n <= max_detail_frames:
+        detail_indices = list(range(n))
+    else:
+        step = (n - 1) / (max_detail_frames - 1)
+        detail_indices = [round(i * step) for i in range(max_detail_frames)]
+
     timestamps: list[str] = []
+    for i, (frame_path, t) in enumerate(frame_results):
+        timestamps.append(f"#{i + 1} {t:.1f}s")
 
-    for frame_path, t in frame_results:
-        timestamps.append(f"{frame_path.name}: {t:.1f}s")
-        images.append(base64.b64encode(frame_path.read_bytes()).decode())
+    detail_labels: list[str] = []
+    for idx in detail_indices:
+        frame_path, t = frame_results[idx]
+        label = f"#{idx + 1} {t:.1f}s"
+        labeled_bytes = _label_frame(frame_path, label)
+        images.append(base64.b64encode(labeled_bytes).decode())
+        detail_labels.append(label)
 
-    # Extract and append audio
+    # Extract and append audio (last image slot)
     audio_path = extract_audio(video_path, start_sec=start_sec, end_sec=end_sec)
     if audio_path:
         images.append(base64.b64encode(audio_path.read_bytes()).decode())
@@ -205,6 +332,9 @@ def analyze_video(
     # Build prompt
     prompt = OLLAMA_VIDEO_PROMPT.format(
         frame_timestamps=", ".join(timestamps),
+        frame_count=len(frame_results),
+        detail_frames=", ".join(detail_labels),
+        detail_count=len(detail_labels),
         duration=analyze_duration,
         filename=video_path.name,
         file_path=str(video_path),
@@ -217,7 +347,11 @@ def analyze_video(
 
     # Parse and validate
     sidecar = _parse_ollama_response(
-        raw, video_path.name, str(video_path), round(native_fps, 3), round(duration, 3),
+        raw,
+        video_path.name,
+        str(video_path),
+        round(native_fps, 3),
+        round(duration, 3),
     )
 
     # Cleanup temp files
