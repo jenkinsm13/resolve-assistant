@@ -199,10 +199,16 @@ def build_contact_sheet(
     return buf.getvalue()
 
 
-def _ollama_chat(prompt: str, images: list[str], timeout: int = OLLAMA_TIMEOUT) -> str:
+def _ollama_chat(
+    prompt: str,
+    images: list[str],
+    schema: dict | None = None,
+    timeout: int = OLLAMA_TIMEOUT,
+) -> str:
     """Send a multimodal chat request to Ollama. Returns response text.
 
     *images* is a list of base64-encoded image or audio data.
+    *schema* if provided, passed as structured output format (Pydantic JSON schema).
     """
     payload = json.dumps(
         {
@@ -215,7 +221,7 @@ def _ollama_chat(prompt: str, images: list[str], timeout: int = OLLAMA_TIMEOUT) 
                 }
             ],
             "stream": False,
-            "format": "json",
+            "format": schema if schema else "json",
         }
     ).encode()
 
@@ -342,10 +348,13 @@ def analyze_video(
         fps=round(native_fps, 3),
     )
 
-    # Call Ollama
+    # Call Ollama — use fast "json" mode, then validate with Pydantic.
+    # Structured schema mode is 50-70% slower due to constrained decoding.
+    from .schemas import VideoSidecar
+
     raw = _ollama_chat(prompt, images)
 
-    # Parse and validate
+    # Parse and validate — force through Pydantic for format parity with Gemini
     sidecar = _parse_ollama_response(
         raw,
         video_path.name,
@@ -353,6 +362,10 @@ def analyze_video(
         round(native_fps, 3),
         round(duration, 3),
     )
+
+    # Validate via Pydantic — coerces types and fills defaults
+    validated = VideoSidecar.model_validate(sidecar)
+    sidecar = validated.model_dump()
 
     # Cleanup temp files
     frame_dir = frame_results[0][0].parent if frame_results else None
@@ -396,4 +409,8 @@ def analyze_audio(audio_path: Path) -> dict:
     data.setdefault("duration", round(duration, 3))
     data.setdefault("sections", [])
 
-    return data
+    # Validate via Pydantic for format parity with Gemini
+    from .schemas import AudioSidecar
+
+    validated = AudioSidecar.model_validate(data)
+    return validated.model_dump()

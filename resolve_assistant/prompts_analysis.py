@@ -151,19 +151,34 @@ A static shot means every thumbnail in the grid looks nearly identical.
 
 ## Step 2: Split into segments
 
-Create a NEW segment at every point where:
-- Camera movement type changes (e.g. static → gimbal move)
-- The camera starts or stops moving
-- Audio transitions (silence → speech, speech → silence, engine start, music change)
-- Hard cut or major framing change
-- Subject or visible content changes substantially
+Segment by SPECIFIC ACTIONS or INDIVIDUAL TAKES. Each segment = one distinct
+action, shot, or take. If the same action repeats (e.g. multiple passes of a
+tracking shot), each take is its own segment.
 
-IMPORTANT: If the first few frames show one composition and later frames show a
-completely different composition (different angle, different part of the subject,
-different background), that is camera movement — NOT a single static segment.
-Most raw footage clips have 2-5 segments. A single segment covering the entire
-clip is RARE and means the framing truly never changed. Verify before outputting
-a single segment.
+Create a NEW segment at every point where:
+- A distinct action begins or ends (opening a door, walking past a subject)
+- Camera movement type changes (static → tracking, handheld → static)
+- Camera enters or exits a space (interior → exterior transition)
+- The same action restarts (a new take of the same shot)
+- New object, person, or vehicle becomes the focus
+- Audio transitions (silence → speech, engine start/stop)
+- Hard cut or major framing change
+
+For each segment, qualify the take:
+- Note focus accuracy (sharp, soft, racking, missed focus)
+- Note stability (locked, steady, shaky, smooth gimbal)
+- Note if it's a false start, partial take, or complete action
+- Use quality_score to reflect these: sharp + stable + complete = 8-10,
+  soft focus or shaky = 5-7, missed focus or unusable shake = 1-4
+
+IMPORTANT: If frames show different compositions (different angle, different
+part of the subject, different background), that is camera movement or a new
+action — NOT a single static segment.
+
+A single continuous cinematic shot (one unbroken action, consistent movement)
+CAN be one segment regardless of length — do not artificially split it.
+But if a clip contains multiple distinct actions, transitions, or repeated
+takes of the same shot, each must be its own segment.
 
 ## Step 3: Classify each segment
 
@@ -218,28 +233,16 @@ a single segment.
 - Speech onset/offset (marks segment boundaries)
 - Describe what you hear in the segment description
 
-Return ONLY valid JSON:
-{{
-  "filename": "{filename}",
-  "file_path": "{file_path}",
-  "media_type": "video",
-  "analysis_model": "{model}",
-  "fps": {fps},
-  "duration": {duration},
-  "segments": [
-    {{
-      "start_sec": <float>,
-      "end_sec": <float>,
-      "type": "a-roll" or "b-roll",
-      "description": "<transcript or visual description>",
-      "camera_movement": "<movement type or null>",
-      "quality_score": <1-10>,
-      "is_good_take": <bool or null>,
-      "filler_words": ["um", ...] or null,
-      "tags": ["keyword", ...]
-    }}
-  ]
-}}
+Return valid JSON matching the provided schema. Use these values for metadata:
+- filename: "{filename}"
+- file_path: "{file_path}"
+- media_type: "video"
+- analysis_model: "{model}"
+- fps: {fps}
+- duration: {duration}
+
+Each segment needs: start_sec, end_sec, type ("a-roll" or "b-roll"),
+description, camera_movement, quality_score (1-10), tags.
 """
 
 
