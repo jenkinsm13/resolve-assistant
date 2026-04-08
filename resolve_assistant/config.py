@@ -77,7 +77,7 @@ GEMINI_MAX_LONG_EDGE = 1280
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma4:e4b")
-OLLAMA_FRAME_RATE = 10.0  # frames per second to extract for analysis
+OLLAMA_FRAME_RATE = 2.0  # frames per second to extract for analysis
 OLLAMA_FRAME_MAX_EDGE = 640  # max long edge for extracted frames (pixels)
 OLLAMA_AUDIO_SAMPLE_RATE = 16000  # 16kHz mono for speech recognition
 OLLAMA_TIMEOUT = 300  # seconds per API call
