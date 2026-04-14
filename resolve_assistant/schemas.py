@@ -61,9 +61,16 @@ class AudioSection(BaseModel):
         default=None, description="Estimated BPM for this section"
     )
     mood: Optional[str] = Field(
-        default=None, description="Emotional character: uplifting, dark, chill, aggressive, etc."
+        default=None,
+        description="Emotional character: uplifting, dark, chill, aggressive, etc.",
     )
     tags: List[str] = Field(default_factory=list)
+
+
+class TranscriptWord(BaseModel):
+    start_sec: float
+    end_sec: float
+    text: str
 
 
 class AudioSidecar(BaseModel):
@@ -76,3 +83,15 @@ class AudioSidecar(BaseModel):
     key: Optional[str] = Field(default=None, description="Musical key if detectable")
     genre: Optional[str] = None
     sections: List[AudioSection] = Field(default_factory=list)
+    # Speech fields (populated by whisper.cpp for speech audio)
+    transcript: Optional[str] = Field(
+        default=None, description="Verbatim speech transcript"
+    )
+    words: List[TranscriptWord] = Field(
+        default_factory=list,
+        description="Word-level timestamps from whisper.cpp (-ml 1)",
+    )
+    transcription_engine: Optional[str] = Field(
+        default=None,
+        description="Engine used for speech transcription (e.g. 'whisper.cpp')",
+    )

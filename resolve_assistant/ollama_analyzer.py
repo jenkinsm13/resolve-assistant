@@ -19,6 +19,7 @@ import json
 import re
 import subprocess
 import tempfile
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -222,6 +223,10 @@ def _ollama_chat(
             ],
             "stream": False,
             "format": schema if schema else "json",
+            # llama.cpp #21825: audio encoder emits ~750 tokens; keeping num_ctx
+            # modest prevents KV-cache contention with audio embeddings that
+            # otherwise triggers the GGML alignment crash (ollama #15333).
+            "options": {"num_ctx": 8192},
         }
     ).encode()
 
@@ -379,37 +384,210 @@ def analyze_video(
     return sidecar
 
 
-def analyze_audio(audio_path: Path) -> dict:
-    """Analyze a standalone audio file using Ollama/Gemma 4 e4b."""
+# Empirically determined on M5 Max + ollama 0.20.6 Metal backend:
+# ggml-metal-device.m:608 `GGML_ASSERT([rsets->data count] == 0)` fires above
+# ~22s per request. CPU-only (num_gpu=0) extends this to ~35s but adds latency.
+# 20s chunks stay comfortably inside the Metal ceiling. Bug tracked at
+# llama.cpp PR #17869 (crash reporting) — underlying fix still upstream.
+# Note: for pure verbatim transcription whisper.cpp is faster and more accurate;
+# this path is best used for semantic audio understanding.
+_AUDIO_CHUNK_SEC = 20.0
+
+
+def _chunk_audio(
+    audio_path: Path, chunk_sec: float = _AUDIO_CHUNK_SEC
+) -> list[tuple[Path, float]]:
+    """Split audio into ≤*chunk_sec* WAVs. Returns [(path, start_offset_sec), ...].
+
+    Fixed-length splits (not silence-aware) — deterministic and simple.
+    Caller must clean up temp files other than the original input.
+    """
     duration = ffprobe_duration(audio_path) or 0.0
+    if duration <= chunk_sec:
+        return [(audio_path, 0.0)]
+
+    out: list[tuple[Path, float]] = []
+    t = 0.0
+    while t < duration:
+        end = min(t + chunk_sec, duration)
+        chunk = Path(tempfile.mktemp(suffix=".wav", prefix="ollama_audio_chunk_"))
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-loglevel",
+                "error",
+                "-i",
+                str(audio_path),
+                "-ss",
+                f"{t:.3f}",
+                "-to",
+                f"{end:.3f}",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-c:a",
+                "pcm_s16le",
+                str(chunk),
+            ],
+            check=True,
+        )
+        out.append((chunk, t))
+        t = end
+    return out
+
+
+def _analyze_audio_single(src: Path, prompt: str, max_retries: int = 3) -> str:
+    """Call _ollama_chat with progressive-trim retry on HTTP 500.
+
+    The ollama #15333 crash is sensitive to exact audio token count; shortening
+    the clip by 0.5s per retry shifts past the offending alignment boundary.
+    """
+    src_duration = ffprobe_duration(src) or 0.0
+    last_exc: Exception | None = None
+
+    for attempt in range(max_retries):
+        trim = attempt * 0.5
+        trimmed: Path | None = None
+        if trim > 0:
+            trimmed = Path(tempfile.mktemp(suffix=".wav", prefix="ollama_audio_trim_"))
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    str(src),
+                    "-t",
+                    f"{max(0.5, src_duration - trim):.3f}",
+                    "-c",
+                    "copy",
+                    str(trimmed),
+                ],
+                check=True,
+            )
+            payload_path = trimmed
+        else:
+            payload_path = src
+
+        try:
+            audio_b64 = base64.b64encode(payload_path.read_bytes()).decode()
+            return _ollama_chat(prompt, [audio_b64])
+        except urllib.error.HTTPError as exc:
+            last_exc = exc
+            if exc.code != 500 or attempt == max_retries - 1:
+                raise
+            log.warning(
+                "Ollama audio HTTP 500 (attempt %d/%d), retrying with %.1fs trim",
+                attempt + 1,
+                max_retries,
+                trim + 0.5,
+            )
+        finally:
+            if trimmed is not None:
+                trimmed.unlink(missing_ok=True)
+
+    assert last_exc is not None
+    raise last_exc
+
+
+def analyze_audio(audio_path: Path, engine: str = "auto") -> dict:
+    """Analyze a standalone audio file.
+
+    *engine*:
+      - "auto" (default): whisper.cpp for speech (fast, verbatim, word-level
+        timestamps). Falls back to ollama/gemma4 music analysis if whisper
+        returns empty transcript (pure music/ambience) OR if whisper is
+        unavailable.
+      - "whisper": force whisper.cpp.
+      - "ollama": force gemma4 — expect 500s/crashes on >20s clips.
+    """
+    duration = ffprobe_duration(audio_path) or 0.0
+
+    if engine in ("auto", "whisper"):
+        try:
+            from .whisper import transcribe_audio as _whisper
+
+            log.info("Whisper transcribing %s (%.1fs)", audio_path.name, duration)
+            w = _whisper(audio_path)
+            if w["transcript"] or engine == "whisper":
+                from .schemas import AudioSidecar
+
+                return AudioSidecar.model_validate(
+                    {
+                        "filename": audio_path.name,
+                        "file_path": str(audio_path),
+                        "media_type": "audio",
+                        "analysis_model": f"whisper.cpp/{w['model']}",
+                        "duration": round(duration, 3),
+                        "transcript": w["transcript"],
+                        "words": w["words"],
+                        "transcription_engine": w["engine"],
+                    }
+                ).model_dump()
+            log.info(
+                "Whisper found no speech in %s; falling through to gemma4",
+                audio_path.name,
+            )
+        except FileNotFoundError as e:
+            if engine == "whisper":
+                raise
+            log.warning("Whisper unavailable (%s); falling back to gemma4", e)
+        except subprocess.CalledProcessError as e:
+            if engine == "whisper":
+                raise
+            log.warning("Whisper failed (%s); falling back to gemma4", e)
 
     log.info("Ollama analyzing audio %s (%.1fs)", audio_path.name, duration)
 
-    audio_b64 = base64.b64encode(audio_path.read_bytes()).decode()
+    chunks = _chunk_audio(audio_path)
+    all_sections: list[dict] = []
+    transcript_parts: list[str] = []
 
-    prompt = OLLAMA_AUDIO_PROMPT.format(
-        filename=audio_path.name,
-        file_path=str(audio_path),
-        model=OLLAMA_MODEL,
-        duration=round(duration, 3),
-    )
+    try:
+        for chunk_path, offset in chunks:
+            chunk_dur = ffprobe_duration(chunk_path) or 0.0
+            prompt = OLLAMA_AUDIO_PROMPT.format(
+                filename=chunk_path.name,
+                file_path=str(chunk_path),
+                model=OLLAMA_MODEL,
+                duration=round(chunk_dur, 3),
+            )
+            raw = _analyze_audio_single(chunk_path, prompt)
 
-    raw = _ollama_chat(prompt, [audio_b64])
+            text = raw.strip()
+            if text.startswith("```"):
+                text = re.sub(r"^```(?:json)?\s*", "", text)
+                text = re.sub(r"\s*```$", "", text)
+            chunk_data = json.loads(text)
 
-    text = raw.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
+            for sec in chunk_data.get("sections", []):
+                if "start_sec" in sec:
+                    sec["start_sec"] = round(sec["start_sec"] + offset, 3)
+                if "end_sec" in sec:
+                    sec["end_sec"] = round(sec["end_sec"] + offset, 3)
+                all_sections.append(sec)
 
-    data = json.loads(text)
-    data.setdefault("filename", audio_path.name)
-    data.setdefault("file_path", str(audio_path))
-    data.setdefault("media_type", "audio")
-    data.setdefault("analysis_model", OLLAMA_MODEL)
-    data.setdefault("duration", round(duration, 3))
-    data.setdefault("sections", [])
+            if chunk_data.get("transcript"):
+                transcript_parts.append(chunk_data["transcript"])
+    finally:
+        for chunk_path, _ in chunks:
+            if chunk_path != audio_path:
+                chunk_path.unlink(missing_ok=True)
 
-    # Validate via Pydantic for format parity with Gemini
+    data: dict = {
+        "filename": audio_path.name,
+        "file_path": str(audio_path),
+        "media_type": "audio",
+        "analysis_model": OLLAMA_MODEL,
+        "duration": round(duration, 3),
+        "sections": all_sections,
+    }
+    if transcript_parts:
+        data["transcript"] = " ".join(transcript_parts)
+
     from .schemas import AudioSidecar
 
     validated = AudioSidecar.model_validate(data)
