@@ -18,6 +18,7 @@ import io
 import json
 import re
 import subprocess
+import time
 import tempfile
 import urllib.error
 import urllib.request
@@ -205,40 +206,64 @@ def _ollama_chat(
     images: list[str],
     schema: dict | None = None,
     timeout: int = OLLAMA_TIMEOUT,
+    retries: int = 3,
+    backoff_ms: float = 2000.0,
 ) -> str:
-    """Send a multimodal chat request to Ollama. Returns response text.
+    """Send a multimodal chat request to Ollama with exponential-backoff retry.
 
-    *images* is a list of base64-encoded image or audio data.
-    *schema* if provided, passed as structured output format (Pydantic JSON schema).
-    """
-    payload = json.dumps(
-        {
-            "model": OLLAMA_MODEL,
-            "messages": [
+     Gemma 4 e4b on Metal can OOM-return 500s when the runner is near capacity.
+     Retries with increasing delay give the model time to recover between attempts.
+
+         *images* is a list of base64-encoded image or audio data.
+         *schema* if provided, passed as structured output format (Pydantic JSON schema).
+     """
+    last_exc: Exception | None = None
+
+    for attempt in range(retries):
+        try:
+            payload = json.dumps(
                 {
-                    "role": "user",
-                    "content": prompt,
-                    "images": images,
+                    "model": OLLAMA_MODEL,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": prompt,
+                            "images": images,
+                        }
+                    ],
+                    "stream": False,
+                    "format": schema if schema else "json",
+                    # llama.cpp #21825: audio encoder emits ~750 tokens; keeping num_ctx
+                    # modest prevents KV-cache contention with audio embeddings that
+                    # otherwise triggers the GGML alignment crash (ollama #15333).
+                    "options": {"num_ctx": 8192},
                 }
-            ],
-            "stream": False,
-            "format": schema if schema else "json",
-            # llama.cpp #21825: audio encoder emits ~750 tokens; keeping num_ctx
-            # modest prevents KV-cache contention with audio embeddings that
-            # otherwise triggers the GGML alignment crash (ollama #15333).
-            "options": {"num_ctx": 8192},
-        }
-    ).encode()
+            ).encode()
 
-    req = urllib.request.Request(
-        f"{OLLAMA_BASE_URL}/api/chat",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-    )
-    resp = urllib.request.urlopen(req, timeout=timeout)
-    data = json.loads(resp.read())
-    return data["message"]["content"]
+            req = urllib.request.Request(
+                f"{OLLAMA_BASE_URL}/api/chat",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            resp = urllib.request.urlopen(req, timeout=timeout)
+            data = json.loads(resp.read())
+            return data["message"]["content"]
+        except (urllib.error.HTTPError, urllib.error.URLError, OSError) as exc:
+            last_exc = exc
+            is_500 = hasattr(exc, "code") and exc.code == 500
+            if attempt < retries - 1:
+                delay = backoff_ms * (2 ** attempt) / 1000.0
+                log.warning(
+                    "Ollama %s (attempt %d/%d), retrying in %.1fs",
+                    "HTTP 500" if is_500 else type(exc).__name__,
+                    attempt + 1,
+                    retries,
+                    delay,
+                )
+                time.sleep(delay)
 
+    assert last_exc is not None
+    raise last_exc
 
 def _parse_ollama_response(
     raw: str,
