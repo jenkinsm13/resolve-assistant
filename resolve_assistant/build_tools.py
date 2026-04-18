@@ -3,15 +3,15 @@ Build timeline MCP tools: build_timeline and build_status.
 """
 
 import json
-import threading
 from pathlib import Path
 from typing import Optional
 
 from .config import log, mcp
 from .media import load_sidecars
 from .build_worker import (
-    _build_worker, _active_build_workers,
-    _write_build_progress, _read_build_progress,
+    _build_worker,
+    _active_build_workers,
+    _read_build_progress,
 )
 
 
@@ -54,20 +54,12 @@ def build_timeline(folder_path: str, instruction: str) -> str:
         except (json.JSONDecodeError, OSError):
             cached_plan = None
 
-    thread = threading.Thread(
-        target=_build_worker,
-        args=(root, sidecars, instruction),
-        kwargs={"cached_plan": cached_plan},
-        daemon=True,
-    )
-    thread.start()
-    _active_build_workers[key] = thread
-
     if cached_plan:
-        return (
-            f"Re-rendering from cached edit plan ({len(cached_plan.get('cuts', []))} cuts). "
-            f"Use build_status('{folder_path}') to monitor."
-        )
+        # Run synchronously — Resolve's AppendToTimeline requires the main thread.
+        _build_worker(root, sidecars, instruction, cached_plan=cached_plan)
+        progress = _read_build_progress(root)
+        detail = progress.get("detail", "") if progress else "done"
+        return f"Re-rendering from cached edit plan ({len(cached_plan.get('cuts', []))} cuts). {detail}"
     return (
         f"Timeline build started ({len(sidecars)} sidecars, uploading proxies to Gemini). "
         f"Use build_status('{folder_path}') to monitor."
