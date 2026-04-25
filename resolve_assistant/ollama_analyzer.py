@@ -16,13 +16,43 @@ people, vehicle details).
 import base64
 import io
 import json
+import os
 import re
+import shutil
 import subprocess
 import time
 import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+# Debug escape hatch: when set, frame/audio temp files are retained on disk
+# instead of being cleaned up. Useful when reproducing an Ollama HTTP 500 or
+# a model parse failure and you need to inspect what the model actually saw.
+# Without this, every cleanup path destroys the evidence.
+_KEEP_FRAMES = os.getenv("RESOLVE_ASSISTANT_KEEP_FRAMES", "").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+
+def _cleanup_frame_dir(dir_path: Path | None) -> None:
+    """Best-effort recursive removal of a frame temp dir. Honors KEEP_FRAMES."""
+    if dir_path is None or _KEEP_FRAMES:
+        return
+    shutil.rmtree(dir_path, ignore_errors=True)
+
+
+def _cleanup_audio_file(audio_path: Path | None) -> None:
+    """Best-effort removal of an audio temp file. Honors KEEP_FRAMES."""
+    if audio_path is None or _KEEP_FRAMES:
+        return
+    try:
+        audio_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
 
 from .config import (
     OLLAMA_BASE_URL,
@@ -47,41 +77,56 @@ def extract_frames(
 
     Returns [(path, timestamp_sec), ...] sorted by time.
     Frame filenames use source frame numbers: frame_000060.jpg = frame 60.
-    Caller is responsible for cleanup of the temp directory.
+    Caller is responsible for cleanup of the returned paths' parent directory
+    on the success path. On failure (ffmpeg timeout, non-zero exit, no frames
+    extracted), this function cleans up its own temp dir before re-raising,
+    so callers never see a leaked dir from a failed call.
     """
     out_dir = Path(tempfile.mkdtemp(prefix="ollama_frames_"))
 
-    cmd = ["ffmpeg"]
-    if start_sec > 0:
-        cmd += ["-ss", str(start_sec)]
-    cmd += ["-i", str(video_path)]
-    if end_sec is not None:
-        cmd += ["-t", str(end_sec - start_sec)]
-    cmd += [
-        "-vf",
-        f"fps={fps},scale={OLLAMA_FRAME_MAX_EDGE}:-1",
-        "-q:v",
-        "3",
-        str(out_dir / "frame_%04d.jpg"),
-        "-y",
-    ]
-    subprocess.run(cmd, capture_output=True, timeout=120, check=True)
+    try:
+        cmd = ["ffmpeg"]
+        if start_sec > 0:
+            cmd += ["-ss", str(start_sec)]
+        cmd += ["-i", str(video_path)]
+        if end_sec is not None:
+            cmd += ["-t", str(end_sec - start_sec)]
+        cmd += [
+            "-vf",
+            f"fps={fps},scale={OLLAMA_FRAME_MAX_EDGE}:-1",
+            "-q:v",
+            "3",
+            str(out_dir / "frame_%04d.jpg"),
+            "-y",
+        ]
+        subprocess.run(cmd, capture_output=True, timeout=120, check=True)
 
-    # Rename sequential frames to source frame numbers
-    native_fps = ffprobe_fps(video_path) or 30.0
-    raw_frames = sorted(out_dir.glob("frame_*.jpg"))
-    interval = 1.0 / fps
-    result: list[tuple[Path, float]] = []
+        # Rename sequential frames to source frame numbers
+        native_fps = ffprobe_fps(video_path) or 30.0
+        raw_frames = sorted(out_dir.glob("frame_*.jpg"))
+        interval = 1.0 / fps
+        result: list[tuple[Path, float]] = []
 
-    for i, frame_path in enumerate(raw_frames):
-        t = start_sec + i * interval
-        source_frame = round(t * native_fps)
-        new_name = f"frame_{source_frame:06d}.jpg"
-        new_path = out_dir / new_name
-        frame_path.rename(new_path)
-        result.append((new_path, t))
+        for i, frame_path in enumerate(raw_frames):
+            t = start_sec + i * interval
+            source_frame = round(t * native_fps)
+            new_name = f"frame_{source_frame:06d}.jpg"
+            new_path = out_dir / new_name
+            frame_path.rename(new_path)
+            result.append((new_path, t))
 
-    return result
+        if not result:
+            # ffmpeg returned 0 but produced no frames (rare — corrupt file,
+            # zero-duration source). Treat as failure and self-clean.
+            raise RuntimeError(f"ffmpeg produced no frames from {video_path.name}")
+
+        return result
+    except BaseException:
+        # Includes TimeoutExpired, CalledProcessError, RuntimeError above, and
+        # also KeyboardInterrupt — any exit other than the normal return must
+        # not leak the dir. We re-raise after cleanup.
+        _cleanup_frame_dir(out_dir)
+        raise
 
 
 def extract_audio(
@@ -114,6 +159,9 @@ def extract_audio(
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
         pass
 
+    # Failure path: ffmpeg either errored, timed out, or wrote a too-small
+    # partial. Remove the file (if any) so it doesn't leak into tempdir.
+    _cleanup_audio_file(out_path)
     return None
 
 
@@ -211,12 +259,12 @@ def _ollama_chat(
 ) -> str:
     """Send a multimodal chat request to Ollama with exponential-backoff retry.
 
-     Gemma 4 e4b on Metal can OOM-return 500s when the runner is near capacity.
-     Retries with increasing delay give the model time to recover between attempts.
+    Gemma 4 e4b on Metal can OOM-return 500s when the runner is near capacity.
+    Retries with increasing delay give the model time to recover between attempts.
 
-         *images* is a list of base64-encoded image or audio data.
-         *schema* if provided, passed as structured output format (Pydantic JSON schema).
-     """
+        *images* is a list of base64-encoded image or audio data.
+        *schema* if provided, passed as structured output format (Pydantic JSON schema).
+    """
     last_exc: Exception | None = None
 
     for attempt in range(retries):
@@ -252,7 +300,7 @@ def _ollama_chat(
             last_exc = exc
             is_500 = hasattr(exc, "code") and exc.code == 500
             if attempt < retries - 1:
-                delay = backoff_ms * (2 ** attempt) / 1000.0
+                delay = backoff_ms * (2**attempt) / 1000.0
                 log.warning(
                     "Ollama %s (attempt %d/%d), retrying in %.1fs",
                     "HTTP 500" if is_500 else type(exc).__name__,
@@ -264,6 +312,7 @@ def _ollama_chat(
 
     assert last_exc is not None
     raise last_exc
+
 
 def _parse_ollama_response(
     raw: str,
@@ -318,95 +367,135 @@ def analyze_video(
     analyze_end = end_sec if end_sec is not None else duration
     analyze_duration = analyze_end - start_sec
 
+    # Adaptive fps: treat the caller's fps as a ceiling, not a mandate.
+    # Ollama/gemma 4 chokes (HTTP 500) once the combined payload gets too
+    # large — empirically ~35 extracted frames is the safe ceiling on M5 Max.
+    # For long clips, scale fps down so we stay within the budget. Short
+    # clips keep the requested density.
+    MAX_FRAMES = 30
+    effective_fps = fps
+    if analyze_duration > 0 and analyze_duration * fps > MAX_FRAMES:
+        effective_fps = MAX_FRAMES / analyze_duration
+
     log.info(
-        "Ollama analyzing %s (%.1fs at %.1f fps, range %.1f-%.1fs)",
+        "Ollama analyzing %s (%.1fs at %.2f fps [requested %.2f], range %.1f-%.1fs)",
         video_path.name,
         analyze_duration,
+        effective_fps,
         fps,
         start_sec,
         analyze_end,
     )
 
-    # Extract frames with source frame numbers
+    # Extract frames with source frame numbers. extract_frames self-cleans
+    # on its own failure paths, so on a raise from here, no dir leaks.
     frame_results = extract_frames(
-        video_path, fps=fps, start_sec=start_sec, end_sec=end_sec
+        video_path, fps=effective_fps, start_sec=start_sec, end_sec=end_sec
     )
+    # frame_results is guaranteed non-empty (extract_frames raises otherwise)
+    # but keep a defensive check for clarity.
     if not frame_results:
         raise RuntimeError(f"No frames extracted from {video_path.name}")
 
-    # Image 1: Contact sheet for temporal/motion overview (all frames)
-    sheet_bytes = build_contact_sheet(frame_results)
-    images: list[str] = [base64.b64encode(sheet_bytes).decode()]
+    frame_dir: Path | None = frame_results[0][0].parent
+    audio_path: Path | None = None
 
-    # Images 2..M+1: Subset of individual labeled frames for fine detail.
-    # Send ~5-8 evenly spaced frames to avoid overwhelming the model.
-    max_detail_frames = 8
-    n = len(frame_results)
-    if n <= max_detail_frames:
-        detail_indices = list(range(n))
-    else:
-        step = (n - 1) / (max_detail_frames - 1)
-        detail_indices = [round(i * step) for i in range(max_detail_frames)]
+    # Once frames exist on disk, EVERY exit path (success, Ollama HTTP 500,
+    # Pydantic validation error, KeyboardInterrupt) must clean up the temp
+    # dir. The previous code only cleaned on the success branch, leaking
+    # ~50 frames per failed analysis. The try/finally is the fix.
+    try:
+        # Pick detail frames (evenly spaced subset of extracted frames).
+        max_detail_frames = 8
+        n = len(frame_results)
+        if n <= max_detail_frames:
+            detail_indices = list(range(n))
+        else:
+            step = (n - 1) / (max_detail_frames - 1)
+            detail_indices = [round(i * step) for i in range(max_detail_frames)]
 
-    timestamps: list[str] = []
-    for i, (frame_path, t) in enumerate(frame_results):
-        timestamps.append(f"#{i + 1} {t:.1f}s")
+        timestamps: list[str] = []
+        for i, (frame_path, t) in enumerate(frame_results):
+            timestamps.append(f"#{i + 1} {t:.1f}s")
 
-    detail_labels: list[str] = []
-    for idx in detail_indices:
-        frame_path, t = frame_results[idx]
-        label = f"#{idx + 1} {t:.1f}s"
-        labeled_bytes = _label_frame(frame_path, label)
-        images.append(base64.b64encode(labeled_bytes).decode())
-        detail_labels.append(label)
+        # Build the images array in the ORDER gemma 4's model card recommends:
+        # "place image and/or audio content BEFORE the text in your prompt."
+        # Within the array, the model card ordering guidance puts audio first
+        # among the non-text modalities — audio conditions vision interpretation
+        # (voiceover, sync cues) more than the other way around.
+        images: list[str] = []
+        detail_labels: list[str] = []
 
-    # Extract and append audio (last image slot)
-    audio_path = extract_audio(video_path, start_sec=start_sec, end_sec=end_sec)
-    if audio_path:
-        images.append(base64.b64encode(audio_path.read_bytes()).decode())
+        # 1) Audio FIRST (if safe to include). Metal's compute graph
+        # (ggml-metal-device.m:608 GGML_ASSERT([rsets->data count] == 0))
+        # aborts the llama runner when the combined vision + audio payload
+        # exceeds ~20s of total encoder work. Empirically clips ≤17s survive
+        # with both. For longer clips we must drop one — vision wins because
+        # it covers the full clip duration.
+        _COMBINED_SAFE_DURATION = 17.0
+        audio_included = False
+        if analyze_duration <= _COMBINED_SAFE_DURATION:
+            audio_path = extract_audio(
+                video_path, start_sec=start_sec, end_sec=analyze_end
+            )
+            if audio_path:
+                images.append(base64.b64encode(audio_path.read_bytes()).decode())
+                audio_included = True
+        else:
+            log.info(
+                "Audio skipped — clip %.1fs exceeds combined safe duration %.1fs (Metal ceiling)",
+                analyze_duration,
+                _COMBINED_SAFE_DURATION,
+            )
 
-    # Build prompt
-    prompt = OLLAMA_VIDEO_PROMPT.format(
-        frame_timestamps=", ".join(timestamps),
-        frame_count=len(frame_results),
-        detail_frames=", ".join(detail_labels),
-        detail_count=len(detail_labels),
-        duration=analyze_duration,
-        filename=video_path.name,
-        file_path=str(video_path),
-        model=OLLAMA_MODEL,
-        fps=round(native_fps, 3),
-    )
+        # 2) Contact sheet (temporal/motion overview of every frame).
+        sheet_bytes = build_contact_sheet(frame_results)
+        images.append(base64.b64encode(sheet_bytes).decode())
 
-    # Call Ollama — use fast "json" mode, then validate with Pydantic.
-    # Structured schema mode is 50-70% slower due to constrained decoding.
-    from .schemas import VideoSidecar
+        # 3) Labeled detail frames for fine inspection.
+        for idx in detail_indices:
+            frame_path, t = frame_results[idx]
+            label = f"#{idx + 1} {t:.1f}s"
+            labeled_bytes = _label_frame(frame_path, label)
+            images.append(base64.b64encode(labeled_bytes).decode())
+            detail_labels.append(label)
 
-    raw = _ollama_chat(prompt, images)
+        # Build prompt
+        prompt = OLLAMA_VIDEO_PROMPT.format(
+            frame_timestamps=", ".join(timestamps),
+            frame_count=len(frame_results),
+            detail_frames=", ".join(detail_labels),
+            detail_count=len(detail_labels),
+            duration=analyze_duration,
+            filename=video_path.name,
+            file_path=str(video_path),
+            model=OLLAMA_MODEL,
+            fps=round(native_fps, 3),
+        )
 
-    # Parse and validate — force through Pydantic for format parity with Gemini
-    sidecar = _parse_ollama_response(
-        raw,
-        video_path.name,
-        str(video_path),
-        round(native_fps, 3),
-        round(duration, 3),
-    )
+        # Call Ollama — use fast "json" mode, then validate with Pydantic.
+        # Structured schema mode is 50-70% slower due to constrained decoding.
+        from .schemas import VideoSidecar
 
-    # Validate via Pydantic — coerces types and fills defaults
-    validated = VideoSidecar.model_validate(sidecar)
-    sidecar = validated.model_dump()
+        raw = _ollama_chat(prompt, images)
 
-    # Cleanup temp files
-    frame_dir = frame_results[0][0].parent if frame_results else None
-    for f, _ in frame_results:
-        f.unlink(missing_ok=True)
-    if frame_dir:
-        frame_dir.rmdir()
-    if audio_path:
-        audio_path.unlink(missing_ok=True)
+        # Parse and validate — force through Pydantic for format parity with Gemini
+        sidecar = _parse_ollama_response(
+            raw,
+            video_path.name,
+            str(video_path),
+            round(native_fps, 3),
+            round(duration, 3),
+        )
 
-    return sidecar
+        # Validate via Pydantic — coerces types and fills defaults
+        validated = VideoSidecar.model_validate(sidecar)
+        sidecar = validated.model_dump()
+
+        return sidecar
+    finally:
+        _cleanup_frame_dir(frame_dir)
+        _cleanup_audio_file(audio_path)
 
 
 # Empirically determined on M5 Max + ollama 0.20.6 Metal backend:
