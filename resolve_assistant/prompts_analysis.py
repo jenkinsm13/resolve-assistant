@@ -47,6 +47,12 @@ Analyze this video and return structured JSON matching the schema below.
 - Provide precise start_sec / end_sec timestamps.
 - Report the clip's native fps and total duration.
 
+**Hook Shot Detection:**
+After analyzing all segments, identify the single best segment for a social
+media hook (the first 1-3 seconds that stops the scroll). Look for dynamic
+camera movement, arresting visuals, action in progress, reveals, or strong
+composition. Set hook_candidate to null if nothing qualifies.
+
 JSON schema:
 {
   "filename": "<original filename>",
@@ -66,7 +72,8 @@ JSON schema:
       "filler_words": ["um", ...] or null,
       "tags": ["keyword", ...]
     }
-  ]
+  ],
+  "hook_candidate": { "segment_index": <int>, "reason": "<string>" } | null
 }
 """
 
@@ -233,6 +240,26 @@ takes of the same shot, each must be its own segment.
 - Speech onset/offset (marks segment boundaries)
 - Describe what you hear in the segment description
 
+## Step 4: Identify hook shot potential
+
+After analyzing all segments, decide if ANY segment in this clip could serve as
+a **social media hook** — the first 1-3 seconds of a reel that stops the scroll.
+
+A great hook shot has one or more of:
+- Dynamic camera movement (rotating reveal, dramatic dolly, sweeping gimbal)
+- Arresting visual (close-up detail, dramatic lighting, satisfying texture)
+- Action in progress (hands working, sparks flying, doors opening)
+- Surprise or reveal (something unexpected enters frame)
+- Strong compositional geometry (leading lines, symmetry, depth)
+
+If a segment qualifies, set `hook_candidate` at the TOP LEVEL of the JSON
+(not inside segments) with:
+- `segment_index`: the zero-based index of the best hook segment
+- `reason`: 1-2 sentences explaining WHY this segment stops the scroll
+
+Set `hook_candidate` to null if no segment is visually compelling enough
+for a hook. Be selective — not every clip has one.
+
 Return valid JSON matching the provided schema. Use these values for metadata:
 - filename: "{filename}"
 - file_path: "{file_path}"
@@ -243,6 +270,8 @@ Return valid JSON matching the provided schema. Use these values for metadata:
 
 Each segment needs: start_sec, end_sec, type ("a-roll" or "b-roll"),
 description, camera_movement, quality_score (1-10), tags.
+
+Top-level `hook_candidate`: {{ "segment_index": <int>, "reason": "<string>" }} or null.
 """
 
 

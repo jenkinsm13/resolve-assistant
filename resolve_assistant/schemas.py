@@ -37,6 +37,15 @@ class VideoSegment(BaseModel):
     tags: List[str] = Field(default_factory=list)
 
 
+class HookCandidate(BaseModel):
+    segment_index: int = Field(
+        description="Zero-based index into the segments array identifying the hook shot"
+    )
+    reason: str = Field(
+        description="Why this segment works as a hook: visual impact, motion, reveal, etc."
+    )
+
+
 class VideoSidecar(BaseModel):
     filename: str
     file_path: str
@@ -45,6 +54,12 @@ class VideoSidecar(BaseModel):
     fps: float = 24.0
     duration: float = 0.0
     segments: List[VideoSegment] = Field(default_factory=list)
+    hook_candidate: Optional[HookCandidate] = Field(
+        default=None,
+        description="The single best segment in this clip for a reel hook — "
+        "high visual impact, dynamic motion, or an arresting reveal. "
+        "null if no segment qualifies.",
+    )
 
 
 class AudioSection(BaseModel):
