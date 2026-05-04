@@ -61,6 +61,7 @@ from .config import (
     OLLAMA_FRAME_MAX_EDGE,
     OLLAMA_AUDIO_SAMPLE_RATE,
     OLLAMA_TIMEOUT,
+    OLLAMA_USE_OPENAI_ENDPOINT,
     log,
 )
 from .ffprobe import ffprobe_fps, ffprobe_duration
@@ -252,6 +253,7 @@ def build_contact_sheet(
 def _ollama_chat(
     prompt: str,
     images: list[str],
+    audio_b64: str | None = None,
     schema: dict | None = None,
     timeout: int = OLLAMA_TIMEOUT,
     retries: int = 3,
@@ -259,43 +261,60 @@ def _ollama_chat(
 ) -> str:
     """Send a multimodal chat request to Ollama with exponential-backoff retry.
 
-    Gemma 4 e4b on Metal can OOM-return 500s when the runner is near capacity.
-    Retries with increasing delay give the model time to recover between attempts.
+    Uses the OpenAI-compatible endpoint for nemotron3 (supports input_audio
+    content parts alongside image_url). Falls back to native /api/chat for
+    gemma4 (audio in the images array).
 
-        *images* is a list of base64-encoded image or audio data.
-        *schema* if provided, passed as structured output format (Pydantic JSON schema).
+    *images*: base64-encoded image data (contact sheet + detail frames).
+    *audio_b64*: base64-encoded WAV audio, sent as input_audio on the OpenAI
+                 endpoint or prepended to images on the native endpoint.
     """
     last_exc: Exception | None = None
 
     for attempt in range(retries):
         try:
-            payload = json.dumps(
-                {
+            if OLLAMA_USE_OPENAI_ENDPOINT:
+                # OpenAI /v1/chat/completions — mixed content parts
+                content: list[dict] = []
+                if audio_b64:
+                    content.append({"type": "input_audio", "input_audio": {"data": audio_b64, "format": "wav"}})
+                for img in images:
+                    content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}"}})
+                content.append({"type": "text", "text": prompt})
+                payload = json.dumps({
                     "model": OLLAMA_MODEL,
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": prompt,
-                            "images": images,
-                        }
-                    ],
+                    "messages": [{"role": "user", "content": content}],
+                    "stream": False,
+                    "response_format": {"type": "json_object"},
+                }).encode()
+                req = urllib.request.Request(
+                    f"{OLLAMA_BASE_URL}/v1/chat/completions",
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                )
+                resp = urllib.request.urlopen(req, timeout=timeout)
+                data = json.loads(resp.read())
+                return data["choices"][0]["message"]["content"]
+            else:
+                # Native /api/chat — audio prepended to images array
+                all_images = images[:]
+                if audio_b64:
+                    all_images.insert(0, audio_b64)
+                payload = json.dumps({
+                    "model": OLLAMA_MODEL,
+                    "messages": [{"role": "user", "content": prompt, "images": all_images}],
                     "stream": False,
                     "format": schema if schema else "json",
-                    # llama.cpp #21825: audio encoder emits ~750 tokens; keeping num_ctx
-                    # modest prevents KV-cache contention with audio embeddings that
-                    # otherwise triggers the GGML alignment crash (ollama #15333).
                     "options": {"num_ctx": 8192},
-                }
-            ).encode()
-
-            req = urllib.request.Request(
-                f"{OLLAMA_BASE_URL}/api/chat",
-                data=payload,
-                headers={"Content-Type": "application/json"},
-            )
-            resp = urllib.request.urlopen(req, timeout=timeout)
-            data = json.loads(resp.read())
-            return data["message"]["content"]
+                }).encode()
+                req = urllib.request.Request(
+                    f"{OLLAMA_BASE_URL}/api/chat",
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                )
+                resp = urllib.request.urlopen(req, timeout=timeout)
+                data = json.loads(resp.read())
+                return data["message"]["content"]
         except (urllib.error.HTTPError, urllib.error.URLError, OSError) as exc:
             last_exc = exc
             is_500 = hasattr(exc, "code") and exc.code == 500
@@ -426,27 +445,31 @@ def analyze_video(
         images: list[str] = []
         detail_labels: list[str] = []
 
-        # 1) Audio FIRST (if safe to include). Metal's compute graph
-        # (ggml-metal-device.m:608 GGML_ASSERT([rsets->data count] == 0))
-        # aborts the llama runner when the combined vision + audio payload
-        # exceeds ~20s of total encoder work. Empirically clips ≤17s survive
-        # with both. For longer clips we must drop one — vision wins because
-        # it covers the full clip duration.
-        _COMBINED_SAFE_DURATION = 17.0
-        audio_included = False
-        if analyze_duration <= _COMBINED_SAFE_DURATION:
+        # Extract audio for combined analysis. nemotron3 sends audio via
+        # the OpenAI endpoint (input_audio content part), so no Metal
+        # duration ceiling applies. gemma4 still uses the native endpoint
+        # where audio goes in the images array with a ~17s ceiling.
+        audio_b64: str | None = None
+        if OLLAMA_USE_OPENAI_ENDPOINT:
             audio_path = extract_audio(
                 video_path, start_sec=start_sec, end_sec=analyze_end
             )
             if audio_path:
-                images.append(base64.b64encode(audio_path.read_bytes()).decode())
-                audio_included = True
+                audio_b64 = base64.b64encode(audio_path.read_bytes()).decode()
         else:
-            log.info(
-                "Audio skipped — clip %.1fs exceeds combined safe duration %.1fs (Metal ceiling)",
-                analyze_duration,
-                _COMBINED_SAFE_DURATION,
-            )
+            _COMBINED_SAFE_DURATION = 17.0
+            if analyze_duration <= _COMBINED_SAFE_DURATION:
+                audio_path = extract_audio(
+                    video_path, start_sec=start_sec, end_sec=analyze_end
+                )
+                if audio_path:
+                    images.append(base64.b64encode(audio_path.read_bytes()).decode())
+            else:
+                log.info(
+                    "Audio skipped — clip %.1fs exceeds combined safe duration %.1fs (Metal ceiling)",
+                    analyze_duration,
+                    _COMBINED_SAFE_DURATION,
+                )
 
         # 2) Contact sheet (temporal/motion overview of every frame).
         sheet_bytes = build_contact_sheet(frame_results)
@@ -477,7 +500,7 @@ def analyze_video(
         # Structured schema mode is 50-70% slower due to constrained decoding.
         from .schemas import VideoSidecar
 
-        raw = _ollama_chat(prompt, images)
+        raw = _ollama_chat(prompt, images, audio_b64=audio_b64)
 
         # Parse and validate — force through Pydantic for format parity with Gemini
         sidecar = _parse_ollama_response(

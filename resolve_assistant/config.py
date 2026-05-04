@@ -72,12 +72,15 @@ SAFE_CODECS = {"h264", "avc", "avc1", "hevc", "h265", "hev1"}
 GEMINI_MAX_LONG_EDGE = 1280
 
 # ---------------------------------------------------------------------------
-# Ollama (optional — for local Gemma 4 analysis)
+# Ollama — local multimodal analysis (nemotron3 default, gemma4 fallback)
 # ---------------------------------------------------------------------------
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma4:e4b")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "nemotron3:33b")
 OLLAMA_FRAME_RATE = 2.0  # frames per second to extract for analysis
-OLLAMA_FRAME_MAX_EDGE = 640  # max long edge for extracted frames (pixels)
+OLLAMA_FRAME_MAX_EDGE = 896  # max long edge for extracted frames (pixels)
 OLLAMA_AUDIO_SAMPLE_RATE = 16000  # 16kHz mono for speech recognition
-OLLAMA_TIMEOUT = 300  # seconds per API call
+OLLAMA_TIMEOUT = 600  # seconds per API call (nemotron3:33b is slower than gemma4:e4b)
+# nemotron3 audio requires the OpenAI /v1/chat/completions endpoint with
+# input_audio content parts. Gemma4 uses the native /api/chat images field.
+OLLAMA_USE_OPENAI_ENDPOINT = OLLAMA_MODEL.startswith("nemotron")
