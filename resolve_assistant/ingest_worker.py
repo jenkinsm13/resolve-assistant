@@ -16,8 +16,10 @@ from .config import MODEL, AUDIO_EXTS, client, log
 from .ffprobe import ffprobe_fps, ffprobe_duration
 from .transcode import prepare_for_gemini
 from .media import (
-    list_all_videos, list_all_audio,
-    list_pending_videos, list_pending_audio,
+    list_all_videos,
+    list_all_audio,
+    list_pending_videos,
+    list_pending_audio,
 )
 from .prompts import ANALYSIS_PROMPT, AUDIO_ANALYSIS_PROMPT
 from .ollama_analyzer import (
@@ -58,7 +60,11 @@ def _transcode_one(video_path: Path) -> tuple[Path, Path | None, str | None]:
 
 
 def _batch_transcode(
-    videos: list[Path], root: Path, already_done: int, total: int, errors: list[str],
+    videos: list[Path],
+    root: Path,
+    already_done: int,
+    total: int,
+    errors: list[str],
 ) -> dict[str, Path]:
     """Transcode all pending videos in parallel. Returns {filename: proxy_path}."""
     proxies: dict[str, Path] = {}
@@ -77,14 +83,17 @@ def _batch_transcode(
             elif proxy:
                 proxies[original.name] = proxy
 
-            _write_progress(root, {
-                "status": "running",
-                "current_file": f"transcoding ({done_count}/{len(videos)})",
-                "current_step": "transcoding",
-                "completed": already_done,
-                "total": total,
-                "errors": errors,
-            })
+            _write_progress(
+                root,
+                {
+                    "status": "running",
+                    "current_file": f"transcoding ({done_count}/{len(videos)})",
+                    "current_step": "transcoding",
+                    "completed": already_done,
+                    "total": total,
+                    "errors": errors,
+                },
+            )
 
     return proxies
 
@@ -105,7 +114,8 @@ def _analyze_gemini(media_path: Path, upload_path: Path, is_audio: bool) -> dict
 
     if is_audio:
         response = retry_gemini(
-            client.models.generate_content, model=MODEL,
+            client.models.generate_content,
+            model=MODEL,
             contents=[file_ref, AUDIO_ANALYSIS_PROMPT],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
@@ -114,7 +124,8 @@ def _analyze_gemini(media_path: Path, upload_path: Path, is_audio: bool) -> dict
         )
     else:
         response = retry_gemini(
-            client.models.generate_content, model=MODEL,
+            client.models.generate_content,
+            model=MODEL,
             contents=[file_ref, ANALYSIS_PROMPT],
             config=types.GenerateContentConfig(
                 media_resolution=types.MediaResolution.MEDIA_RESOLUTION_HIGH,
@@ -124,6 +135,73 @@ def _analyze_gemini(media_path: Path, upload_path: Path, is_audio: bool) -> dict
         )
 
     return json.loads(response.text)
+
+
+def _validate_analysis(data, *, is_audio: bool) -> Optional[str]:
+    """Return None if *data* looks like a usable analysis result, or a
+    short human-readable reason string explaining why it should be
+    rejected. Callers re-prompt the model on rejection and refuse to
+    write a sidecar that never validates.
+
+    Empty/malformed sidecars are the worst possible failure mode here:
+    the file looks "done" (the .json exists and the skip-pass refuses to
+    re-analyze) but downstream tools find no content to act on. That
+    cost the user a real clip (VID_2875.MP4: `segments: []` with a
+    `hook_candidate.segment_index: 0` pointing into the empty list).
+
+    For VIDEOS we require:
+      - Top-level dict (not None, not a list).
+      - `segments` present, a list, and at least one element.
+      - Each segment is a dict (defensive — Pydantic schema should
+        guarantee this, but the Ollama backend doesn't go through
+        Pydantic and has produced malformed entries in the wild).
+      - If `hook_candidate.segment_index` is set, it points at a real
+        index within `segments` (catches the exact VID_2875 shape).
+
+    For AUDIO we require:
+      - Top-level dict.
+      - Non-empty `transcript` or `description` — at least ONE textual
+        field with content (different prompts populate different fields).
+
+    We deliberately DON'T validate optional fields like `mood`, `tags`,
+    `analysis_model`, etc. — a partial result is still useful if the
+    core structure is intact. The goal is to catch "the model gave us
+    nothing usable," not to enforce a strict schema.
+    """
+    if not isinstance(data, dict):
+        return f"top-level result is {type(data).__name__}, not dict"
+
+    if is_audio:
+        transcript = data.get("transcript")
+        description = data.get("description")
+        has_text = (isinstance(transcript, str) and transcript.strip()) or (
+            isinstance(description, str) and description.strip()
+        )
+        if not has_text:
+            return "audio analysis has no transcript and no description"
+        return None
+
+    # Video validation.
+    segments = data.get("segments")
+    if not isinstance(segments, list):
+        return f"segments missing or not a list (got {type(segments).__name__})"
+    if len(segments) == 0:
+        return "segments list is empty"
+    for idx, seg in enumerate(segments):
+        if not isinstance(seg, dict):
+            return f"segments[{idx}] is {type(seg).__name__}, not dict"
+
+    hook = data.get("hook_candidate")
+    if isinstance(hook, dict):
+        hook_idx = hook.get("segment_index")
+        if isinstance(hook_idx, int):
+            if hook_idx < 0 or hook_idx >= len(segments):
+                return (
+                    f"hook_candidate.segment_index={hook_idx} "
+                    f"out of range for segments(len={len(segments)})"
+                )
+
+    return None
 
 
 def _ingest_worker(
@@ -149,61 +227,127 @@ def _ingest_worker(
     # --- Phase 1: Parallel transcode (Gemini backend only) ---
     proxies: dict[str, Path] = {}
     if backend != "ollama":
-        _write_progress(root, {
-            "status": "running",
-            "current_file": f"transcoding 0/{len(pending_videos)}",
-            "current_step": "transcoding",
-            "completed": already_done,
-            "total": total,
-            "errors": errors,
-        })
+        _write_progress(
+            root,
+            {
+                "status": "running",
+                "current_file": f"transcoding 0/{len(pending_videos)}",
+                "current_step": "transcoding",
+                "completed": already_done,
+                "total": total,
+                "errors": errors,
+            },
+        )
         proxies = _batch_transcode(pending_videos, root, already_done, total, errors)
     else:
-        _write_progress(root, {
-            "status": "running",
-            "current_file": "starting ollama analysis",
-            "current_step": "analyzing",
-            "completed": already_done,
-            "total": total,
-            "errors": errors,
-        })
+        _write_progress(
+            root,
+            {
+                "status": "running",
+                "current_file": "starting ollama analysis",
+                "current_step": "analyzing",
+                "completed": already_done,
+                "total": total,
+                "errors": errors,
+            },
+        )
 
     # --- Phase 2: Analyze each file ---
     pending = pending_videos + pending_audio
+
+    # Bad-analysis retry budget. If the model returns an empty/malformed
+    # result (e.g. `segments: []` for a video that clearly has content),
+    # we re-prompt up to this many times before giving up — empty
+    # sidecars are useless for downstream timeline builders and have
+    # tripped silent failures where the clip looked "done" but had
+    # nothing to act on. Cap is low so a genuinely-empty clip doesn't
+    # spin forever.
+    MAX_ANALYSIS_ATTEMPTS = 3
 
     for i, media_path in enumerate(pending):
         sidecar_path = media_path.with_suffix(media_path.suffix + ".json")
         is_audio = media_path.suffix.lower() in AUDIO_EXTS
 
         try:
-            if backend == "ollama":
-                _write_progress(root, {
-                    "status": "running", "current_file": media_path.name,
-                    "current_step": "analyzing (ollama)",
-                    "completed": already_done + i,
-                    "total": total, "errors": errors,
-                })
+            sidecar_data = None
+            last_validation_failure = None
 
-                if is_audio:
-                    sidecar_data = ollama_analyze_audio(media_path)
+            for attempt in range(1, MAX_ANALYSIS_ATTEMPTS + 1):
+                if backend == "ollama":
+                    step = (
+                        "analyzing (ollama)"
+                        if attempt == 1
+                        else f"analyzing (ollama, retry {attempt - 1})"
+                    )
+                    _write_progress(
+                        root,
+                        {
+                            "status": "running",
+                            "current_file": media_path.name,
+                            "current_step": step,
+                            "completed": already_done + i,
+                            "total": total,
+                            "errors": errors,
+                        },
+                    )
+
+                    if is_audio:
+                        candidate = ollama_analyze_audio(media_path)
+                    else:
+                        candidate = ollama_analyze_video(media_path, fps=fps)
                 else:
-                    sidecar_data = ollama_analyze_video(media_path, fps=fps)
-            else:
-                # Gemini path — upload then analyze
-                if is_audio:
-                    upload_path = media_path
-                else:
-                    upload_path = proxies.get(media_path.name, media_path)
+                    # Gemini path — upload then analyze
+                    if is_audio:
+                        upload_path = media_path
+                    else:
+                        upload_path = proxies.get(media_path.name, media_path)
 
-                _write_progress(root, {
-                    "status": "running", "current_file": media_path.name,
-                    "current_step": "uploading",
-                    "completed": already_done + i,
-                    "total": total, "errors": errors,
-                })
+                    step = (
+                        "uploading"
+                        if attempt == 1
+                        else f"uploading (retry {attempt - 1})"
+                    )
+                    _write_progress(
+                        root,
+                        {
+                            "status": "running",
+                            "current_file": media_path.name,
+                            "current_step": step,
+                            "completed": already_done + i,
+                            "total": total,
+                            "errors": errors,
+                        },
+                    )
 
-                sidecar_data = _analyze_gemini(media_path, upload_path, is_audio)
-                sidecar_data["analysis_model"] = MODEL
+                    candidate = _analyze_gemini(media_path, upload_path, is_audio)
+                    candidate["analysis_model"] = MODEL
+
+                # Validate the analysis before we accept it. An empty or
+                # malformed result MUST NOT be persisted as a sidecar —
+                # downstream "skip if .json exists" logic would then
+                # treat the clip as done forever, and timeline builders
+                # would find nothing to use.
+                validation_error = _validate_analysis(candidate, is_audio=is_audio)
+                if validation_error is None:
+                    sidecar_data = candidate
+                    break
+                last_validation_failure = validation_error
+                log.warning(
+                    "Analysis attempt %d/%d for %s rejected: %s",
+                    attempt,
+                    MAX_ANALYSIS_ATTEMPTS,
+                    media_path.name,
+                    validation_error,
+                )
+
+            if sidecar_data is None:
+                # All attempts produced a bad analysis. Leave NO sidecar
+                # on disk so the next run picks this clip up again, and
+                # record the failure so the user sees it in the report.
+                raise RuntimeError(
+                    f"analysis returned empty/malformed result after "
+                    f"{MAX_ANALYSIS_ATTEMPTS} attempts (last: {last_validation_failure})"
+                )
 
             sidecar_data["file_path"] = str(media_path)
             sidecar_data["filename"] = media_path.name
@@ -216,20 +360,30 @@ def _ingest_worker(
                 if probe_dur:
                     sidecar_data["duration"] = round(probe_dur, 3)
 
-            sidecar_path.write_text(json.dumps(sidecar_data, indent=2), encoding="utf-8")
+            sidecar_path.write_text(
+                json.dumps(sidecar_data, indent=2), encoding="utf-8"
+            )
 
         except Exception as exc:
             errors.append(f"{media_path.name}: {exc}")
 
     done_count = total - len(list_pending_videos(root)) - len(list_pending_audio(root))
-    _write_progress(root, {
-        "status": "complete", "current_file": None, "current_step": None,
-        "completed": done_count, "total": total, "errors": errors,
-    })
+    _write_progress(
+        root,
+        {
+            "status": "complete",
+            "current_file": None,
+            "current_step": None,
+            "completed": done_count,
+            "total": total,
+            "errors": errors,
+        },
+    )
 
     if build_instruction:
         try:
             from .build import _build_worker  # lazy import avoids circular dep
+
             _build_worker(root, build_instruction)
         except Exception as exc:
             log.error("Auto-build after ingest failed: %s", exc)
