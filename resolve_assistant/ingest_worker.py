@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
-from .config import MODEL, AUDIO_EXTS, client, log
+from .config import MODEL, OLLAMA_MODEL, AUDIO_EXTS, client, log
 from .ffprobe import ffprobe_fps, ffprobe_duration
 from .transcode import prepare_for_gemini
 from .media import (
@@ -275,9 +275,9 @@ def _ingest_worker(
             for attempt in range(1, MAX_ANALYSIS_ATTEMPTS + 1):
                 if backend == "ollama":
                     step = (
-                        "analyzing (ollama)"
+                        f"analyzing ({OLLAMA_MODEL})"
                         if attempt == 1
-                        else f"analyzing (ollama, retry {attempt - 1})"
+                        else f"analyzing ({OLLAMA_MODEL}, retry {attempt - 1})"
                     )
                     _write_progress(
                         root,
