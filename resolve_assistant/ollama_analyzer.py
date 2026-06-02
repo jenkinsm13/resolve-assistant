@@ -62,6 +62,7 @@ from .config import (
     OLLAMA_AUDIO_SAMPLE_RATE,
     OLLAMA_TIMEOUT,
     OLLAMA_USE_OPENAI_ENDPOINT,
+    OLLAMA_SEND_AUDIO,
     log,
 )
 from .ffprobe import ffprobe_fps, ffprobe_duration
