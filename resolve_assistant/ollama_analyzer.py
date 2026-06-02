@@ -277,16 +277,28 @@ def _ollama_chat(
                 # OpenAI /v1/chat/completions — mixed content parts
                 content: list[dict] = []
                 if audio_b64:
-                    content.append({"type": "input_audio", "input_audio": {"data": audio_b64, "format": "wav"}})
+                    content.append(
+                        {
+                            "type": "input_audio",
+                            "input_audio": {"data": audio_b64, "format": "wav"},
+                        }
+                    )
                 for img in images:
-                    content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}"}})
+                    content.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{img}"},
+                        }
+                    )
                 content.append({"type": "text", "text": prompt})
-                payload = json.dumps({
-                    "model": OLLAMA_MODEL,
-                    "messages": [{"role": "user", "content": content}],
-                    "stream": False,
-                    "response_format": {"type": "json_object"},
-                }).encode()
+                payload = json.dumps(
+                    {
+                        "model": OLLAMA_MODEL,
+                        "messages": [{"role": "user", "content": content}],
+                        "stream": False,
+                        "response_format": {"type": "json_object"},
+                    }
+                ).encode()
                 req = urllib.request.Request(
                     f"{OLLAMA_BASE_URL}/v1/chat/completions",
                     data=payload,
@@ -300,13 +312,17 @@ def _ollama_chat(
                 all_images = images[:]
                 if audio_b64:
                     all_images.insert(0, audio_b64)
-                payload = json.dumps({
-                    "model": OLLAMA_MODEL,
-                    "messages": [{"role": "user", "content": prompt, "images": all_images}],
-                    "stream": False,
-                    "format": schema if schema else "json",
-                    "options": {"num_ctx": 8192},
-                }).encode()
+                payload = json.dumps(
+                    {
+                        "model": OLLAMA_MODEL,
+                        "messages": [
+                            {"role": "user", "content": prompt, "images": all_images}
+                        ],
+                        "stream": False,
+                        "format": schema if schema else "json",
+                        "options": {"num_ctx": 8192},
+                    }
+                ).encode()
                 req = urllib.request.Request(
                     f"{OLLAMA_BASE_URL}/api/chat",
                     data=payload,
@@ -450,7 +466,11 @@ def analyze_video(
         # duration ceiling applies. gemma4 still uses the native endpoint
         # where audio goes in the images array with a ~17s ceiling.
         audio_b64: str | None = None
-        if OLLAMA_USE_OPENAI_ENDPOINT:
+        if not OLLAMA_SEND_AUDIO:
+            # Vision-only (default). Skip audio extraction entirely — faster and
+            # avoids any model audio-path issues. Set OLLAMA_SEND_AUDIO=1 to re-enable.
+            pass
+        elif OLLAMA_USE_OPENAI_ENDPOINT:
             audio_path = extract_audio(
                 video_path, start_sec=start_sec, end_sec=analyze_end
             )
@@ -500,7 +520,16 @@ def analyze_video(
         # Structured schema mode is 50-70% slower due to constrained decoding.
         from .schemas import VideoSidecar
 
-        raw = _ollama_chat(prompt, images, audio_b64=audio_b64)
+        try:
+            raw = _ollama_chat(prompt, images, audio_b64=audio_b64)
+        except urllib.error.HTTPError as exc:
+            if exc.code != 500 or not audio_b64:
+                raise
+            log.warning(
+                "Ollama HTTP 500 for combined audio+vision payload on %s; retrying vision-only",
+                video_path.name,
+            )
+            raw = _ollama_chat(prompt, images, audio_b64=None)
 
         # Parse and validate — force through Pydantic for format parity with Gemini
         sidecar = _parse_ollama_response(
