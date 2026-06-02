@@ -2,10 +2,33 @@
 Ingest MCP tools: ingest_footage and ingest_status.
 """
 
+import os
 import shutil
 import threading
 from pathlib import Path
 from typing import Optional
+
+
+def _find_ffprobe() -> Optional[str]:
+    """Locate ffprobe across the environments we're spawned under.
+
+    GUI-launched macOS apps (Dock / Finder / Xcode) get a sanitized PATH that
+    omits /opt/homebrew/bin, so `shutil.which("ffprobe")` returns None even
+    when the user has ffmpeg installed. Honor an explicit FFPROBE env var
+    (set by the spawning Swift app) before falling back to PATH, then to
+    known Homebrew install locations.
+    """
+    explicit = os.environ.get("FFPROBE")
+    if explicit and Path(explicit).is_file() and os.access(explicit, os.X_OK):
+        return explicit
+    found = shutil.which("ffprobe")
+    if found:
+        return found
+    for candidate in ("/opt/homebrew/bin/ffprobe", "/usr/local/bin/ffprobe"):
+        if Path(candidate).is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
 
 from .config import mcp, OLLAMA_BASE_URL
 from .media import (
@@ -84,8 +107,10 @@ def ingest_footage(
         if not Path("/usr/bin/avconvert").exists():
             return "Error: avconvert not found. Requires macOS 13+ with Xcode command-line tools."
 
-    if not shutil.which("ffprobe"):
-        return "Error: ffprobe not found on PATH. Install: brew install ffmpeg"
+    ffprobe_path = _find_ffprobe()
+    if not ffprobe_path:
+        return "Error: ffprobe not found on PATH or via FFPROBE env. Install: brew install ffmpeg"
+    os.environ["FFPROBE"] = ffprobe_path
 
     already_done = total - len(pending)
     _write_progress(
