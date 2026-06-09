@@ -93,8 +93,10 @@ OLLAMA_TIMEOUT = 600  # seconds per API call
 # endpoint with input_audio content parts. Gemma4 uses the native /api/chat
 # images field with audio prepended to the images array.
 OLLAMA_USE_OPENAI_ENDPOINT = OLLAMA_MODEL.startswith("nemotron")
-# Send the clip's audio track alongside the frames. Default OFF: vision-only
-# is markedly faster (no audio extraction, smaller payload) and is the right
-# call when the chosen model's audio path is unwanted or unavailable. Set
-# OLLAMA_SEND_AUDIO=1 to re-enable combined audio+vision analysis.
-OLLAMA_SEND_AUDIO = os.getenv("OLLAMA_SEND_AUDIO", "0") == "1"
+# Send the clip's audio track alongside the frames. Default ON: combined
+# audio+vision is the wanted behavior (gemma4:e4b has both — verified via
+# `ollama show`). Vision-only is faster (no audio extraction, smaller payload),
+# so set OLLAMA_SEND_AUDIO=0 to disable. NOTE: an audio-incapable model (e.g.
+# nemotron3, vision-only in Ollama) returns HTTP 400 on clips with audio, so if
+# you switch OLLAMA_MODEL to such a model you must also set OLLAMA_SEND_AUDIO=0.
+OLLAMA_SEND_AUDIO = os.getenv("OLLAMA_SEND_AUDIO", "1") == "1"
