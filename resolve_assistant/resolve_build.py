@@ -119,13 +119,24 @@ def build_timeline_direct(edit_plan: dict, resolve_obj) -> tuple:
             a_start = float(audio_info.get("start_sec", 0))
             a_end = float(audio_info.get("end_sec", 0))
             if a_end > a_start:
+                # Without trackIndex+recordFrame Resolve appends the music to
+                # the END of A1, doubling the program length and burying the
+                # bed after the clip audio (hit in production 2026-06-12).
+                # Pin it to A2 at the program start, under the video.
+                try:
+                    if timeline.GetTrackCount("audio") < 2:
+                        timeline.AddTrack("audio", "stereo")
+                except Exception:
+                    pass
                 media_pool.AppendToTimeline(
                     [
                         {
                             "mediaPoolItem": a_clip,
                             "startFrame": round(a_start * timeline_fps),
                             "endFrame": round(a_end * timeline_fps),
+                            "recordFrame": timeline.GetStartFrame(),
                             "mediaType": 2,
+                            "trackIndex": 2,
                         }
                     ]
                 )
