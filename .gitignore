@@ -14,3 +14,6 @@ venv/
 .ingest_progress.json
 .build_progress.json
 .resolve_build_progress.json
+
+# Claude Code worktrees
+.claude/worktrees/
