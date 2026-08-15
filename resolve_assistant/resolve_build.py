@@ -5,10 +5,10 @@ Timeline building: AppendToTimeline pipeline, marker utilities, XML import fallb
 from pathlib import Path
 
 from .resolve import (
-    get_resolve,
+    _FPS_MAP,
     _collect_clips_recursive,
     _unique_timeline_name,
-    _FPS_MAP,
+    get_resolve,
 )
 from .resolve_transforms import _apply_clip_transform, _apply_speed_ramp
 
@@ -79,7 +79,14 @@ def build_timeline_direct(edit_plan: dict, resolve_obj) -> tuple:
                 "endFrame": round(float(cut["end_sec"]) * clip_fps),
             }
             if "timeline_in" in cut:
-                clip_dict["recordFrame"] = round(
+                # recordFrame is ABSOLUTE, but timelines start at their start TC
+                # (01:00:00:00 = frame 216000), so a program-relative timeline_in
+                # must be offset by it or the clip lands before the timeline head.
+                # The audio branch below has always done this; the video branch
+                # did not, which made timeline_in unusable and forced every cut
+                # to be appended end-to-end -- letting per-clip length error
+                # ACCUMULATE into audible drift (0.35s over 24 cuts, 2026-06-12).
+                clip_dict["recordFrame"] = timeline.GetStartFrame() + round(
                     float(cut["timeline_in"]) * timeline_fps
                 )
                 clip_dict["trackIndex"] = cut.get("track", 1)
@@ -105,6 +112,37 @@ def build_timeline_direct(edit_plan: dict, resolve_obj) -> tuple:
                 ramp = cut.get("speed_ramp")
                 if ramp:
                     _apply_speed_ramp(item, ramp, timeline_fps)
+
+    # Read back what Resolve actually laid down. Source clips whose native rate
+    # differs from the timeline (60.0 media in a 59.94 timeline is the common
+    # case) get conformed, and the resulting length can differ from the
+    # requested one -- silently, and cumulatively when clips are appended
+    # end-to-end. Never trust the "N/N clips" count alone: report the real
+    # numbers so a drifting build cannot be mistaken for a good one.
+    drift_note = ""
+    if appended:
+        worst = 0
+        off = 0
+        for i, item in enumerate(appended):
+            if i >= len(clip_cuts):
+                break
+            cut = clip_cuts[i]
+            want = round(
+                (float(cut["end_sec"]) - float(cut["start_sec"])) * timeline_fps
+            )
+            try:
+                got = int(item.GetDuration())
+            except Exception:
+                continue
+            if got != want:
+                off += 1
+                worst = max(worst, abs(got - want))
+        if off:
+            drift_note = (
+                f" WARNING: {off}/{len(appended)} clips differ from the planned "
+                f"length (worst {worst} frame(s)); pin cuts with 'timeline_in' "
+                f"to stop the error accumulating."
+            )
 
     # Audio track (music bed)
     audio_info = edit_plan.get("audio_track")
@@ -145,6 +183,7 @@ def build_timeline_direct(edit_plan: dict, resolve_obj) -> tuple:
     msg = f"Timeline '{name}' created with {n_appended}/{len(clip_items)} video clips."
     if missing:
         msg += f" Missing from pool: {', '.join(missing)}."
+    msg += drift_note
     return (n_appended > 0 or len(clip_items) == 0, msg)
 
 
