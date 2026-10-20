@@ -13,6 +13,30 @@ from .resolve import (
 from .resolve_transforms import _apply_clip_transform, _apply_speed_ramp
 
 
+def _ensure_video_tracks(timeline, clip_items: list) -> None:
+    """Create V2..Vn so cuts carrying trackIndex > 1 have somewhere to land."""
+    wanted = max((c.get("trackIndex", 1) for c in clip_items), default=1)
+    while timeline.GetTrackCount("video") < wanted:
+        timeline.AddTrack("video")
+
+
+def _verify_video_tracks(timeline, clip_items: list) -> list:
+    """Return one problem string per video track whose real clip count differs from the plan."""
+    expected: dict = {}
+    for c in clip_items:
+        t = c.get("trackIndex", 1)
+        expected[t] = expected.get(t, 0) + 1
+    problems = []
+    for t, want in sorted(expected.items()):
+        try:
+            got = len(timeline.GetItemListInTrack("video", t) or [])
+        except Exception:
+            got = 0
+        if got != want:
+            problems.append(f"V{t} has {got}/{want}")
+    return problems
+
+
 def build_timeline_direct(edit_plan: dict, resolve_obj) -> tuple:
     """Build a Resolve timeline from *edit_plan* using ``AppendToTimeline``.
 
@@ -102,6 +126,10 @@ def build_timeline_direct(edit_plan: dict, resolve_obj) -> tuple:
         )
         clip_items, clip_cuts = [p[0] for p in paired], [p[1] for p in paired]
 
+    # AppendToTimeline never creates video tracks: a trackIndex:2 cut with no V2
+    # is dropped while the call still returns an item, so the build reported
+    # "N/N" for a timeline with b-roll missing (Larry Visiting WIP, 2026-10-20).
+    _ensure_video_tracks(timeline, clip_items)
     appended = media_pool.AppendToTimeline(clip_items) if clip_items else []
 
     if appended:
@@ -180,11 +208,15 @@ def build_timeline_direct(edit_plan: dict, resolve_obj) -> tuple:
                 )
 
     n_appended = len(appended) if appended else 0
+    # The append return value can't be trusted; count what is actually on each track.
+    track_problems = _verify_video_tracks(timeline, clip_items)
     msg = f"Timeline '{name}' created with {n_appended}/{len(clip_items)} video clips."
+    if track_problems:
+        msg += " WARNING: clips missing from the timeline -- " + "; ".join(track_problems) + "."
     if missing:
         msg += f" Missing from pool: {', '.join(missing)}."
     msg += drift_note
-    return (n_appended > 0 or len(clip_items) == 0, msg)
+    return ((n_appended > 0 or len(clip_items) == 0) and not track_problems, msg)
 
 
 def read_timeline_markers(timeline) -> list:
